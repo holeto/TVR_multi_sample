@@ -133,7 +133,7 @@ class Vectorizer:
         pair_idx = self.pairs.index(pair)
 
         options = self.get_options(trans_info)
-        option_vec = np.zeros(self.n_pairs, dtype=np.bool)
+        option_vec = np.zeros(self.n_pairs, dtype=bool)
         for option in options:
             option_vec[option] = 1
 
@@ -219,7 +219,7 @@ class Vectorizer:
         return [self.vec2trans(*v) for v in vectors]
 
     def _create(self, n_dim, val_dim=None):
-        t = np.zeros(n_dim, dtype=np.bool)
+        t = np.zeros(n_dim, dtype=bool)
         if val_dim is not None:
             t[val_dim] = 1
         return t

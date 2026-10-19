@@ -173,12 +173,15 @@ class Scene:
         assert camera in self.cameras.values()
         self.current_camera = camera
 
-    def set_scene(self, objects, cameras, lamps):
-        self.reset()
+    def set_cameras_lamps(self, cameras, lamps):
         for key, loc in cameras.items():
             self.cameras[key].location = Vector(loc)
         for key, loc in lamps.items():
             self.lamps[key].location = Vector(loc)
+
+    def set_scene(self, objects, cameras, lamps):
+        self.reset()
+        self.set_cameras_lamps(cameras, lamps)
         for obj in objects:
             self.add_object(
                 obj["shape"],
@@ -208,16 +211,28 @@ class Scene:
                     + (random.random() - 0.5) * 2.0 * jitter
                 )
 
-    def create_random_object(self, visible=True):
-        shape, _ = self.option.random_shape()
-        size, _ = self.option.random_size()
-        theta = self.option.random_rotation()
-        radius = self.option.get_size(size)
-        position = self.option.random_position(radius, visible)
-        if position is None:
-            return None
-        material, _ = self.option.random_material()
-        color, _ = self.option.random_color()
+    def create_random_object(self, visible=True, exclude=None, key_fn=None):
+        # exclude: keys (computed by key_fn on the attributes) to avoid.
+        while True:
+            shape, _ = self.option.random_shape()
+            size, _ = self.option.random_size()
+            theta = self.option.random_rotation()
+            radius = self.option.get_size(size)
+            position = self.option.random_position(radius, visible)
+            if position is None:
+                return None
+            material, _ = self.option.random_material()
+            color, _ = self.option.random_color()
+            if exclude is None:
+                break
+            attrs = {
+                "shape": shape,
+                "size": size,
+                "material": material,
+                "color": color,
+            }
+            if key_fn(attrs) not in exclude:
+                break
 
         obj, obj_description = self.add_object(
             shape, size, theta, *position, material, color

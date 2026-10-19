@@ -11,6 +11,7 @@ python docker.py
 python docker.py --root
 """
 import argparse
+import getpass
 import os
 import signal
 import subprocess
@@ -117,7 +118,7 @@ def _set_env(env_path=DEFAULT_ENV_PATH, verbose=False):
     e = Env(env_path)
     e["UID"] = os.getuid()
     e["GID"] = os.getgid()
-    e["USER_NAME"] = os.getlogin()
+    e["USER_NAME"] = getpass.getuser()
 
     def _get_value_from_stdin(prompt, default=None):
         value = input(f"{prompt} [{default}]: ").strip() or default

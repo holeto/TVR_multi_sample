@@ -15,6 +15,7 @@ sys.path.append(current_dir)
 from record import Recorder, SampleManager  # noqa: E402
 from scene import Scene  # noqa: E402
 
+import group  # noqa: E402
 import utils  # noqa: E402
 
 """
@@ -75,6 +76,8 @@ class Renderer:
 
     def prepare_basic_settings(self):
         self.recorder = Recorder()
+        # One recorder per member of the current transformation.
+        self.recorders = [self.recorder]
 
         self.global_seed = utils.hash_seed(
             self.config.problem, self.config.seed
@@ -83,9 +86,17 @@ class Renderer:
         self.start = config.start
         self.end = config.start + config.n_sample
         self.current_idx = self.start
+        self.current_member = 0
         self.current_stage = 0
 
         self.scene_reload_time = 10
+
+        self.n_replay_try = 0
+        self.n_replay_fail = 0
+
+    @property
+    def group_mode(self):
+        return self.config.n_per_trans > 1
 
     def load_scene(self):
         self.logger.info("Loading scene into blender...")
@@ -150,6 +161,12 @@ class Renderer:
             return "{:02d}".format(self.current_stage)
 
     @property
+    def sample_tag(self):
+        if self.group_mode:
+            return "{:06d}_{:02d}".format(self.current_idx, self.current_member)
+        return "{:06d}".format(self.current_idx)
+
+    @property
     def images_path(self):
         cameras = (
             self.initial_cameras
@@ -159,10 +176,10 @@ class Renderer:
         return {
             cam: os.path.join(
                 str(self.image_dir),
-                "{}_{}_img_{:06d}-{}.{}.png".format(
+                "{}_{}_img_{}-{}.{}.png".format(
                     self.config.dataset_prefix,
                     self.config.problem,
-                    self.current_idx,
+                    self.sample_tag,
                     self.str_stage,
                     cam,
                 ),
@@ -175,10 +192,10 @@ class Renderer:
         return {
             cam: os.path.join(
                 str(self.seg_dir),
-                "{}_{}_seg_{:06d}-{}.{}.png".format(
+                "{}_{}_seg_{}-{}.{}.png".format(
                     self.config.dataset_prefix,
                     self.config.problem,
-                    self.current_idx,
+                    self.sample_tag,
                     self.str_stage,
                     cam,
                 ),
@@ -190,10 +207,10 @@ class Renderer:
     def blend_path(self):
         return os.path.join(
             str(self.blend_dir),
-            "{}_{}_{:06d}-{}.blend".format(
+            "{}_{}_{}-{}.blend".format(
                 self.config.dataset_prefix,
                 self.config.problem,
-                self.current_idx,
+                self.sample_tag,
                 self.str_stage,
             ),
         )
@@ -202,15 +219,19 @@ class Renderer:
     def json_path(self):
         return os.path.join(
             str(self.info_dir),
-            "{}_{}_{:06d}.json".format(
+            "{}_{}_{}.json".format(
                 self.config.dataset_prefix,
                 self.config.problem,
-                self.current_idx,
+                self.sample_tag,
             ),
         )
 
     @property
     def prefix(self):
+        if self.group_mode:
+            return "#{}.{}-{} ".format(
+                self.current_idx, self.current_member, self.current_stage
+            )
         return "#{}-{} ".format(self.current_idx, self.current_stage)
 
     def info(self, message):
@@ -225,8 +246,10 @@ class Renderer:
     def exclude_output_dir(self, path_dict):
         return {key: os.path.basename(path) for key, path in path_dict.items()}
 
-    def set_seed(self):
+    def set_seed(self, member=0):
         seed = [self.global_seed, self.current_idx]
+        if member > 0:
+            seed.append(member)
         random.seed(str(seed))
         np.random.seed(seed)
 
@@ -237,17 +260,26 @@ class Renderer:
                 self.load_scene()
 
             # Skip existing samples.
-            if os.path.isfile(self.json_path):
-                info = self.sample_manager.record_json(self.json_path)
+            json_paths = self.member_json_paths()
+            existing = [path for path in json_paths if os.path.isfile(path)]
+            if len(existing) == len(json_paths):
+                infos = [self.sample_manager.record_json(json_paths[0])]
+                for path in json_paths[1:]:
+                    with open(path, "r") as f:
+                        infos.append(json.load(f))
                 if self.current_idx >= replace_start:
-                    self.render_from_json(info)
+                    self.render_group(infos)
                 continue
+            # A partially generated transformation is generated again.
+            for path in existing:
+                self.warning("Removing incomplete member {}".format(path))
+                os.remove(path)
 
             self.logger.info("---")
             self.set_seed()
             while True:
                 try:
-                    if self.build_sample():
+                    if self.build_group():
                         self.sample_manager.sample_success()
                         self.summary()
                         break
@@ -267,6 +299,58 @@ class Renderer:
     2. transformed objects can not be moved out (visible in final states)
     3. transformed objects can not be occluded (visible in final states)
     """
+
+    def member_json_paths(self):
+        paths = []
+        for self.current_member in range(self.config.n_per_trans):
+            paths.append(self.json_path)
+        self.current_member = 0
+        return paths
+
+    def build_group(self):
+        # The first member (anchor) is sampled with the balanced sampler, the
+        # others replay its transformation on new initial scenes.
+        self.current_member = 0
+        self.recorder = Recorder()
+        self.recorders = [self.recorder]
+        if not self.build_sample():
+            return False
+
+        if self.group_mode:
+            anchor_info = self.recorder.info
+            plan = group.extract_plan(
+                anchor_info,
+                self.scene.option.is_visible,
+                self.scene.option.size.keys(),
+                keep_size=self.config.replay_keep_size,
+                split=self.scene.option.SPLIT,
+            )
+            for member in range(1, self.config.n_per_trans):
+                self.logger.info("---")
+                self.current_member = member
+                self.set_seed(member)
+                self.recorder = Recorder()
+                self.recorders.append(self.recorder)
+                if not self.build_replay(plan, anchor_info, member):
+                    self.n_replay_fail += 1
+                    return False
+
+        # Save the information about the samples into json files.
+        infos = []
+        for self.current_member, recorder in enumerate(self.recorders):
+            self.info("Saveing info...")
+            if not recorder.save(self.json_path, self.config.json_indent):
+                return False
+            with open(self.json_path, "r") as f:
+                infos.append(json.load(f))
+        self.render_group(infos)
+
+        return True
+
+    def render_group(self, infos):
+        for self.current_member, info in enumerate(infos):
+            self.render_from_json(info)
+        self.current_member = 0
 
     def build_sample(self):
         # Sample the initial state.
@@ -316,16 +400,176 @@ class Renderer:
                 )
             )
 
-        # Save the information about the sample into a json file.
-        self.info("Saveing info...")
-        if not self.recorder.save(self.json_path, self.config.json_indent):
+        # Replays check the whole sample, so the anchor has to pass the same.
+        if self.group_mode and not self.validate_observability():
             return False
 
-        with open(self.json_path, "r") as f:
-            info = json.load(f)
-        self.render_from_json(info)
-
         return True
+
+    def build_replay(self, plan, anchor_info, member):
+        self.num_step = len(plan["steps"])
+        for attempt in range(1, self.config.replay_max_tries + 1):
+            self.n_replay_try += 1
+            self.current_stage = 0
+            slots = self.sample_replay_state(plan, anchor_info, member)
+            if slots is None:
+                continue
+            self.record()
+            if self.occluded_at_init(slots):
+                continue
+            if not self.replay_steps(plan, slots):
+                continue
+            if self.validate_observability():
+                self.info("* Replay succeeded (attempt {}).".format(attempt))
+                return True
+        self.warning(
+            "[Fail] No replay after {} attempts.".format(
+                self.config.replay_max_tries
+            )
+        )
+        return False
+
+    def sample_replay_state(self, plan, anchor_info, member):
+        self.info("Start to building replay state.")
+        self.scene.reset()
+        if self.config.replay_share_jitter:
+            self.scene.set_cameras_lamps(
+                anchor_info["cameras"], anchor_info["lamps"]
+            )
+            self.scene.view_directions = self.scene._compute_directions()
+        else:
+            self.scene.perturb_camera(self.config.camera_jitter)
+            self.scene.perturb_lamp(self.config.lamp_jitter)
+        self.recorder.init(self.scene, self.current_idx, member)
+
+        option = self.scene.option
+        roles = plan["roles"]
+        total_obj = self.config.total_obj
+
+        # Place targets first, at starts from which all of their moves are
+        # feasible. Their space is reserved before other objects are placed.
+        targets = []
+        for role in roles:
+            size = random.choice(role["sizes"])
+            radius = option.get_size(size)
+            position = option.random_trajectory_start(
+                radius, role["constraints"]
+            )
+            if position is None:
+                self.warning(
+                    "[Fail] No start position for {}.".format(role["key"])
+                )
+                return None
+            option.record_obj_addition(position[0], position[1], radius)
+            targets.append((size, position))
+
+        # Decide the visibilities of objects.
+        n_vis_targets = len([r for r in roles if r["constraints"][0][2]])
+        n_invis_targets = len(roles) - n_vis_targets
+        low = max(self.config.min_init_vis, n_vis_targets)
+        high = min(self.config.max_init_vis, total_obj - n_invis_targets)
+        if low > high:
+            self.warning("[Fail] No valid number of visible objects.")
+            return None
+        n_vis = random.randint(low, high)
+        visible_choices = [True] * n_vis + [False] * (total_obj - n_vis)
+        random.shuffle(visible_choices)
+
+        # Random slots for targets, so that obj_idx carries no information.
+        slots = []
+        free_slots = list(range(total_obj))
+        for role in roles:
+            slot = random.choice(
+                [
+                    i
+                    for i in free_slots
+                    if visible_choices[i] == role["constraints"][0][2]
+                ]
+            )
+            free_slots.remove(slot)
+            slots.append(slot)
+
+        # Other objects must not share a descriptor with a target.
+        exclude = set(role["key"] for role in roles)
+
+        def key_fn(attrs):
+            return group.obj_key(attrs, self.config.replay_keep_size)
+
+        for i, visible in enumerate(visible_choices):
+            if i in slots:
+                role = roles[slots.index(i)]
+                size, (x, y) = targets[slots.index(i)]
+                _, obj = self.scene.add_object(
+                    role["desc"]["shape"],
+                    size,
+                    option.random_rotation(),
+                    x,
+                    y,
+                    role["desc"]["material"],
+                    role["desc"]["color"],
+                )
+            else:
+                obj = self.scene.create_random_object(
+                    visible=visible, exclude=exclude, key_fn=key_fn
+                )
+            if obj is None:
+                self.warning(
+                    "{} No enough space for {} objects.".format(
+                        i, "visible" if visible else "invisible"
+                    )
+                )
+                return None
+            self.info(
+                "{} ({:^9s}) Put a {:6s} {:6s} {:6s} {:8s}"
+                " at ({:3d}, {:3d}){}".format(
+                    i,
+                    "visible" if visible else "invisible",
+                    obj["size"],
+                    obj["color"],
+                    obj["material"],
+                    obj["shape"],
+                    *obj["position"],
+                    " (target)" if i in slots else ""
+                )
+            )
+
+        return slots
+
+    def occluded_at_init(self, slots):
+        # Rule 1. Occluded objects can not be transformed.
+        status = self.recorder.info["states"][0]["status"]
+        for slot in slots:
+            name = self.scene.get_name(self.scene.objects[slot])
+            for cam in self.initial_cameras:
+                if status[cam][name] == "occluded":
+                    self.warning("[Fail] target {} is occluded.".format(slot))
+                    return True
+        return False
+
+    def replay_steps(self, plan, slots):
+        for role, pair, move_type in plan["steps"]:
+            self.current_stage += 1
+            obj = self.scene.objects[slots[role]]
+            is_success, response = self.transform(obj, pair, move_type)
+            if not is_success:
+                self.warning("[Fail] Replay of {} failed.".format(pair))
+                return False
+            self.record(trans_response=response)
+        return True
+
+    def validate_observability(self):
+        # Rules 1 and 3 on the whole sample. Unlike the per-step checks, this
+        # covers shape, material and color steps and all initial cameras.
+        failures = group.occluded_targets(
+            self.recorder.info, self.initial_cameras, self.final_cameras
+        )
+        for idx, stage, cam in failures:
+            self.warning(
+                "[Fail] target {} is occluded at stage {} in {}.".format(
+                    idx, stage, cam
+                )
+            )
+        return len(failures) == 0
 
     def render_from_json(self, info):
         cameras = info["cameras"]
@@ -438,6 +682,14 @@ class Renderer:
 
         choices = [self.scene.get_index(obj) for obj in choices]
 
+        # Replays identify targets by their descriptor, so it must be unique.
+        if self.group_mode:
+            unique = group.unique_key_indices(
+                self.recorder.info["states"][0]["objects"],
+                self.config.replay_keep_size,
+            )
+            choices = [idx for idx in choices if idx in unique]
+
         return choices
 
     def transform(self, obj, pair, move_type=None):
@@ -449,6 +701,16 @@ class Renderer:
             "obj_name": self.scene.get_name(obj),
             "obj_idx": self.scene.get_index(obj),
         }
+        # Identity of the object across members: its initial attributes.
+        init_obj = self.recorder.info["states"][0]["objects"][
+            trans_info["obj_idx"]
+        ]
+        trans_info["obj_key"] = group.obj_key(
+            init_obj, self.config.replay_keep_size
+        )
+        trans_info["obj_desc"] = group.obj_desc(
+            init_obj, self.config.replay_keep_size
+        )
         trans_func = getattr(self, "t_{}".format(attr))
         args = trans + [move_type] if move_type else trans
         self.info("{} <- {}".format(trans_info["obj_name"], pair))
@@ -728,15 +990,18 @@ class Renderer:
 
     def clear_history(self):
         self.logger.info("Removing files after failed...")
-        for scene in self.recorder.info["states"]:
-            for image in scene["images"].values():
-                img_path = self.image_dir / image
-                if img_path.exists():
-                    img_path.unlink()
-            for seg in scene["segs"].values():
-                seg_path = self.seg_dir / seg
-                if seg_path.exists():
-                    seg_path.unlink()
+        for recorder in self.recorders:
+            if not hasattr(recorder, "info"):
+                continue
+            for scene in recorder.info["states"]:
+                for image in scene["images"].values():
+                    img_path = self.image_dir / image
+                    if img_path.exists():
+                        img_path.unlink()
+                for seg in scene["segs"].values():
+                    seg_path = self.seg_dir / seg
+                    if seg_path.exists():
+                        seg_path.unlink()
 
     def summary(self):
         self.logger.info("---")
@@ -762,6 +1027,12 @@ class Renderer:
                 state["stage_success"], state["rate_stage_success"]
             )
         )
+        if self.group_mode:
+            self.logger.info(
+                "Replay attempts: {} (transformations dropped: {})".format(
+                    self.n_replay_try, self.n_replay_fail
+                )
+            )
         self.logger.info("Total time: {}".format(utils.time2str(state["time"])))
         self.logger.info(
             "Average sample time: {}".format(

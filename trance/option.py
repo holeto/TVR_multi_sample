@@ -189,6 +189,10 @@ class Option:
         else:
             return self.pm.random_invisible(radius)
 
+    def random_trajectory_start(self, radius, constraints):
+        mask = self.pm.trajectory_mask(constraints, radius)
+        return self.pm.random_from_mask(mask)
+
     def pos2real(self, x, y):
         real_x = x * self.original_coordinate["unit"]
         real_y = y * self.original_coordinate["unit"]
@@ -334,3 +338,31 @@ class PositionManger:
 
     def random_position(self, obj_radius=0):
         return self._random_pos(self._erosion(self.pos, obj_radius))
+
+    def _shift(self, mat, dx, dy):
+        # out[i, j] = mat[i + dx, j + dy], False where that is off the grid.
+        out = np.zeros(mat.shape, dtype=bool)
+        n_x, n_y = mat.shape
+        if abs(dx) >= n_x or abs(dy) >= n_y:
+            return out
+        out[
+            max(-dx, 0) : n_x + min(-dx, 0), max(-dy, 0) : n_y + min(-dy, 0)
+        ] = mat[
+            max(dx, 0) : n_x + min(dx, 0), max(dy, 0) : n_y + min(dy, 0)
+        ]
+        return out
+
+    def trajectory_mask(self, constraints, obj_radius=0):
+        """Free start cells from which every (dx, dy) offset stays on the grid
+        and has the required visibility.
+
+        constraints: [(dx, dy, visible)]
+        """
+        mask = self._erosion(self.pos, obj_radius).astype(bool)
+        visible = self.visible.astype(bool)
+        for dx, dy, vis in constraints:
+            mask &= self._shift(visible if vis else ~visible, dx, dy)
+        return mask
+
+    def random_from_mask(self, mask):
+        return self._random_pos(mask)

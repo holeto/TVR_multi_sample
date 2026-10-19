@@ -13,10 +13,6 @@ FROM deepbase/project:codebase
 # Install python packages
 # ==================================================
 
-# Setup TUNA mirror (optional)
-RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
-COPY misc/.condarc /root/.condarc
-
 # By default, install packages from `requirements.txt` with pip.
 COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \

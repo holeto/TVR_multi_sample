@@ -57,6 +57,13 @@ class ReasonCriterion(nn.Module):
             metrics = {**metrics, **loss_dict}
 
         data = {**outputs, **metrics}
+        if compute_loss:
+            # The losses are batch means; record sums over the samples (as
+            # floats, not graph-attached tensors) so that averages are exact.
+            n_loss_sample = outputs["obj_target"].shape[0]
+            data["n_loss_sample"] = n_loss_sample
+            for key in ["loss", "loss_obj", "loss_pair"]:
+                data[key] = metrics[key].item() * n_loss_sample
         if record_detail and "detail" in data:
             data["detail"]["sample_id"] = outputs["sample_id"].tolist()
         self.recorder.update(data)

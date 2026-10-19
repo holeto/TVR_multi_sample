@@ -27,17 +27,13 @@ ENV BLENDER_PYTHON ${BLENDER_DIR}/2.79/python/bin/python3.5m
 
 RUN ${BLENDER_PYTHON} -m ensurepip
 RUN ${BLENDER_PYTHON} -m \
-    pip install --no-cache-dir -U pip \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
-    -i http://pypi.tuna.tsinghua.edu.cn/simple
+    pip install --no-cache-dir -U pip
 
 COPY requirements.txt /tmp/requirements.txt
 RUN rm -rf ${BLENDER_DIR}/2.79/python/lib/python3.5/site-packages/numpy*
 RUN /usr/local/blender/2.79/python/bin/python3.5m -m \
     pip install --no-cache-dir \
     -r /tmp/requirements.txt \
-    --trusted-host pypi.tuna.tsinghua.edu.cn \
-    -i http://pypi.tuna.tsinghua.edu.cn/simple \
     && rm -f /tmp/requirements.txt
 
 RUN ln -s ${BLENDER_DIR}/blender /usr/local/bin/blender

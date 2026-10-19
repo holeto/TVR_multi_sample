@@ -15,9 +15,9 @@ class BasicRecorder(nn.Module):
 
     def compute(self):
         return {
-            "loss": self.get_average("loss"),
-            "loss_obj": self.get_average("loss_obj"),
-            "loss_pair": self.get_average("loss_pair"),
+            "loss": self.get_loss_average("loss"),
+            "loss_obj": self.get_loss_average("loss_obj"),
+            "loss_pair": self.get_loss_average("loss_pair"),
             "acc": self.get_average("acc"),
             "acc_obj": self.get_average("acc_obj"),
             "acc_pair": self.get_average("acc_pair"),
@@ -50,6 +50,14 @@ class BasicRecorder(nn.Module):
             sum(self.metrics["n_sample"]) + self.EPSILON
         )
 
+    def get_loss_average(self, key):
+        # Losses are recorded as sums over the samples of a batch (see
+        # ReasonCriterion), counted separately because the evaluator, which
+        # provides n_sample, does not run on every training step.
+        return sum(self.metrics[key]) / (
+            sum(self.metrics["n_loss_sample"]) + self.EPSILON
+        )
+
     def reset(self):
         # self.t_start = time.time()
         self.metrics = defaultdict(list)
@@ -77,9 +85,9 @@ class EventRecorder(BasicRecorder):
     def compute(self):
         state = OrderedDict(
             {
-                "loss": self.get_average("loss"),
-                "loss_obj": self.get_average("loss_obj"),
-                "loss_pair": self.get_average("loss_pair"),
+                "loss": self.get_loss_average("loss"),
+                "loss_obj": self.get_loss_average("loss_obj"),
+                "loss_pair": self.get_loss_average("loss_pair"),
                 "acc": self.get_average("acc"),
                 "loose_acc": self.get_average("loose_acc"),
                 "avg_dist": self.get_average("avg_dist"),
@@ -120,9 +128,9 @@ class ViewRecorder(EventRecorder):
     def compute(self):
         state = OrderedDict(
             {
-                "loss": self.get_average("loss"),
-                "loss_obj": self.get_average("loss_obj"),
-                "loss_pair": self.get_average("loss_pair"),
+                "loss": self.get_loss_average("loss"),
+                "loss_obj": self.get_loss_average("loss_obj"),
+                "loss_pair": self.get_loss_average("loss_pair"),
                 "acc": self.get_average("acc"),
                 "loose_acc": self.get_average("loose_acc"),
                 "avg_dist": self.get_average("avg_dist"),
@@ -215,9 +223,9 @@ class ReinforceEventRecorder(BasicRecorder):
     def compute(self):
         state = OrderedDict(
             {
-                "loss": self.get_average("loss"),
-                "loss_obj": self.get_average("loss_obj"),
-                "loss_pair": self.get_average("loss_pair"),
+                "loss": self.get_loss_average("loss"),
+                "loss_obj": self.get_loss_average("loss_obj"),
+                "loss_pair": self.get_loss_average("loss_pair"),
                 "reward": self.get_average("reward"),
                 "acc": self.get_average("acc"),
                 "loose_acc": self.get_average("loose_acc"),

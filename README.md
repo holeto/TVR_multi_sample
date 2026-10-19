@@ -1,3 +1,8 @@
+# FORK of TVR
+Changes to the generation process, such that it is allowed to generate multiple examples corresponding to a single transformation. Meant to better test the generalization of methods learned on this data.
+
+The rest of this README is the original repo README
+
 # TVR - Transformation driven Visual Reasoning
 
 <br>

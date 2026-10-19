@@ -39,8 +39,8 @@ class BasicLoss(nn.Module):
 
         result = {
             "loss": loss,
-            "obj_loss": obj_result,
-            "pair_loss": pair_result,
+            "loss_obj": obj_result,
+            "loss_pair": pair_result,
         }
         return result
 
@@ -114,8 +114,8 @@ class ReinforceLoss(nn.Module):
 
         result = {
             "loss": loss,
-            "obj_loss": obj_result,
-            "pair_loss": pair_result,
+            "loss_obj": obj_result,
+            "loss_pair": pair_result,
             "reward": reward,
         }
         return result

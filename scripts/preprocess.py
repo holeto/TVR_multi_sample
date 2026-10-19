@@ -9,6 +9,7 @@ from PIL import Image
 from tqdm import tqdm
 
 FLUSH = 100
+RESOURCE_DIR = Path(__file__).resolve().parent.parent / "trance" / "resource"
 
 
 def get_group(h5, name):
@@ -54,8 +55,8 @@ def read_image(path, resize_w, resize_h):
 
 
 def copy_resources(target_dir):
-    RESOURCE_PROPERTIES = Path("trance/resources/properties.json")
-    RESOURCE_VALUES = Path("trance/resources/values.json")
+    RESOURCE_PROPERTIES = RESOURCE_DIR / "properties.json"
+    RESOURCE_VALUES = RESOURCE_DIR / "values.json"
 
     target_dir = Path(target_dir)
     target_dir.mkdir(exist_ok=True, parents=True)
@@ -118,12 +119,14 @@ def preprocess(
 
 def preprocess_parser(parser):
     parser.add_argument("dataroot")
-    parser.add_argument("--width", default=160)
-    parser.add_argument("--height", default=120)
+    parser.add_argument("--width", type=int, default=160)
+    parser.add_argument("--height", type=int, default=120)
     parser.add_argument(
         "--split-name", nargs="+", default=["train", "val", "test"]
     )
-    parser.add_argument("--split", nargs="+", default=[500000, 10000, 20000])
+    parser.add_argument(
+        "--split", nargs="+", type=int, default=[500000, 10000, 20000]
+    )
     parser.add_argument("--force", action="store_true")
 
 

@@ -288,9 +288,12 @@ class Recorder:
         assert mode in ["simple", "renderable", "full", "custom"]
         self.mode = mode
 
-    def init(self, scene, idx):
+    def init(self, scene, idx, member=0):
         self.info = {
             "idx": idx,
+            # Samples with the same trans_id share one transformation.
+            "trans_id": idx,
+            "member": member,
             "states": [],
             "transformations": [],
             "n_transformation": 0,

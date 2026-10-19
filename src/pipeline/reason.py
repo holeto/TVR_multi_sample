@@ -115,17 +115,30 @@ class ReasonLitModule(LightningModule):
         )
         self.criterion.reset()
 
+    def on_train_epoch_start(self):
+        self.criterion.reset()
+
     def training_step(self, batch: Any, batch_idx: int):
         outputs = self.step(batch, compute_loss=True)
 
-        metrics = self.criterion.compute()
-        for name, value in metrics.items():
+        # Losses of this batch; Lightning averages them over the epoch.
+        batch_size = batch["obj_target"].shape[0]
+        for name in ["loss", "loss_obj", "loss_pair"]:
             self.log(
                 f"train/{name}",
-                value,
+                outputs[name],
                 on_step=True,
                 on_epoch=True,
+                batch_size=batch_size,
             )
+
+        # Other metrics exist only when the evaluator runs during training.
+        # They are running averages over the epoch so far.
+        if self.criterion.compute_metrics_during_training:
+            metrics = self.criterion.compute()
+            for name, value in metrics.items():
+                if not name.startswith("loss"):
+                    self.log(f"train/{name}", value, on_step=True)
 
         return outputs["loss"]
 
@@ -133,7 +146,7 @@ class ReasonLitModule(LightningModule):
         self.criterion.reset()
 
     def validation_step(self, batch: Any, batch_idx: int):
-        self.step(batch, compute_loss=False)
+        self.step(batch, compute_loss=True)
 
     def validation_epoch_end(self, outputs: List[Any]):
         metrics = self.criterion.compute(verbose=True)
@@ -149,7 +162,7 @@ class ReasonLitModule(LightningModule):
         self.criterion.reset()
 
     def test_step(self, batch: Any, batch_idx: int):
-        self.step(batch, compute_loss=False, record_detail=True)
+        self.step(batch, compute_loss=True, record_detail=True)
 
     def test_epoch_end(self, outputs: List[Any]):
         metrics = self.criterion.compute(verbose=True)

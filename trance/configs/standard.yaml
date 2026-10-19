@@ -12,6 +12,10 @@ min_init_vis: 1 # The minimum number of visible objects in the initial states.
 max_init_vis: 10 # The maximum number of visible objects in the initial states.
 min_trans: 1 # The minimum number of transformations between initial and final states.
 max_trans: 4 # The maximum number of transformations between initial and final states.
+n_per_trans: 1 # The number of samples (members) per transformation. Members after the first replay its transformation on new initial scenes.
+replay_keep_size: true # If true, target objects keep their size across members. If false, only color, material and shape identify them.
+replay_share_jitter: false # If true, members reuse the camera and lamp positions of the first member.
+replay_max_tries: 50 # The number of scene attempts per member before the whole transformation is resampled.
 
 width: 320 # The width of rendering images (in pixels).
 height: 240 # The height of rendering images (in pixels).
