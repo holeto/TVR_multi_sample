@@ -64,6 +64,11 @@ class Renderer:
         self.blend_dir = self.output_dir.joinpath("blend")
         self.info_dir = self.output_dir.joinpath("info")
         self.seg_dir = self.output_dir.joinpath("seg")
+        # The canonical steps of every transformation, as the grammar writes
+        # them. One line is appended per newly generated transformation.
+        self.abstract_path = self.output_dir.joinpath(
+            "transformation_abstract_{}.jsonl".format(self.config.n_per_trans)
+        )
 
         directories = [self.image_dir, self.seg_dir, self.info_dir]
 
@@ -93,6 +98,15 @@ class Renderer:
 
         self.n_replay_try = 0
         self.n_replay_fail = 0
+        self.n_canonical_fail = 0
+        self.n_core_fail = 0
+        self.n_in_fail = 0
+
+        if not self.config.replay_keep_size:
+            self.logger.warning(
+                "Target descriptors have no size (replay_keep_size: false), "
+                "so {} is not written.".format(self.abstract_path.name)
+            )
 
     @property
     def group_mode(self):
@@ -142,8 +156,34 @@ class Renderer:
             if pair.startswith(tuple(self.config.valid_attr))
         ]
         assert config.min_init_vis <= config.max_init_vis <= config.total_obj
+        assert (
+            0
+            <= config.min_sample_shared_objects
+            <= config.max_sample_shared_objects
+        )
+        # Anchors need visible core distractors besides a target, so fewer
+        # visible objects are never drawn for them.
+        min_init_vis = config.min_init_vis
+        if self.group_mode and config.min_sample_shared_objects > 0:
+            min_init_vis = max(
+                min_init_vis, config.min_sample_shared_objects + 1
+            )
+        # And min_invisible_distractors objects that can move in (in-targets
+        # and core decoys), so they keep that many objects out of view.
+        max_init_vis = config.max_init_vis
+        assert (
+            0
+            <= config.min_invisible_distractors
+            <= config.max_invisible_distractors
+        )
+        if self.group_mode and config.min_invisible_distractors > 0:
+            max_init_vis = min(
+                max_init_vis,
+                config.total_obj - config.min_invisible_distractors,
+            )
+        assert min_init_vis <= max_init_vis
         self.sample_manager = SampleManager(
-            valid_init_vis=range(config.min_init_vis, config.max_init_vis + 1),
+            valid_init_vis=range(min_init_vis, max_init_vis + 1),
             total_obj=config.total_obj,
             valid_steps=range(config.min_trans, config.max_trans + 1),
             valid_pairs=valid_pairs,
@@ -284,7 +324,9 @@ class Renderer:
                         self.summary()
                         break
                     else:
-                        self.sample_manager.sample_fail()
+                        self.sample_manager.sample_fail(
+                            keep_init_vis=self.core_failed
+                        )
                         self.clear_history()
                 except KeyboardInterrupt:
                     self.warning("Keyboard Interrupted.")
@@ -313,27 +355,45 @@ class Renderer:
         self.current_member = 0
         self.recorder = Recorder()
         self.recorders = [self.recorder]
+        self.core_failed = False
         if not self.build_sample():
             return False
-
-        if self.group_mode:
-            anchor_info = self.recorder.info
-            plan = group.extract_plan(
-                anchor_info,
-                self.scene.option.is_visible,
-                self.scene.option.size.keys(),
-                keep_size=self.config.replay_keep_size,
-                split=self.scene.option.SPLIT,
+        # Every transformation gets the same number of objects that can move
+        # in, in-targets included, so that their number does not tell whether
+        # it has an in-move. At least one of them must be a decoy.
+        n_in = self.config.min_invisible_distractors
+        n_targets = len(self.in_targets(self.recorder.info))
+        if self.group_mode and n_in > 0 and n_targets >= n_in:
+            self.warning(
+                "[Fail] {} in-targets leave no decoy of {}.".format(
+                    n_targets, n_in
+                )
             )
-            for member in range(1, self.config.n_per_trans):
-                self.logger.info("---")
-                self.current_member = member
-                self.set_seed(member)
-                self.recorder = Recorder()
-                self.recorders.append(self.recorder)
-                if not self.build_replay(plan, anchor_info, member):
-                    self.n_replay_fail += 1
-                    return False
+            self.n_in_fail += 1
+            return False
+        core = self.choose_core(self.recorder.info)
+        chosen = self.choose_decoys(self.recorder.info)
+        if core is None or chosen is None:
+            # The visible count stays used, so the balanced sampler does not
+            # keep drawing counts that can not hold the core.
+            self.n_core_fail += 1
+            self.core_failed = True
+            return False
+
+        # Steps are recorded in canonical order, on the anchor's initial
+        # scene with its decoys re-placed. If that is invalid on the anchor or
+        # on a member, the transformation is dropped.
+        decoys, objects = chosen
+        anchor = self.build_canonical(self.recorder.info, objects)
+        if anchor is None:
+            self.n_canonical_fail += 1
+            return False
+        self.current_member = 0
+        self.recorder = anchor
+        self.recorders = [anchor]
+        if not self.build_members(core, decoys):
+            self.n_replay_fail += 1
+            return False
 
         # Save the information about the samples into json files.
         infos = []
@@ -343,8 +403,227 @@ class Renderer:
                 return False
             with open(self.json_path, "r") as f:
                 infos.append(json.load(f))
+        self.save_abstract(infos)
         self.render_group(infos)
 
+        return True
+
+    def save_abstract(self, infos):
+        if not self.config.replay_keep_size:
+            return
+        line = group.abstract_transformation(
+            infos[0], split=self.scene.option.SPLIT
+        )
+        line["members"] = [
+            os.path.basename(path) for path in self.member_json_paths()
+        ]
+        with open(str(self.abstract_path), "a") as f:
+            f.write(json.dumps(line) + "\n")
+
+    def extract_plan(self, info):
+        return group.extract_plan(
+            info,
+            self.scene.option.is_visible,
+            self.scene.option.size.keys(),
+            keep_size=self.config.replay_keep_size,
+            split=self.scene.option.SPLIT,
+        )
+
+    def build_canonical(self, info, objects=None):
+        # Commuting steps are sorted, so that their order carries no
+        # information the images do not show. The steps are replayed on the
+        # initial state of `info`, or on `objects` if given; returns the
+        # recorder of the replay (the current one if neither the order nor
+        # the objects change), or None if the replay is invalid.
+        plan = self.extract_plan(info)
+        steps = group.canonical_steps(plan)
+        if steps == plan["steps"] and objects is None:
+            return self.recorder
+        if objects is None:
+            objects = info["states"][0]["objects"]
+        self.info("[Order] Replaying the steps in canonical order.")
+        self.recorder = Recorder()
+        self.current_stage = 0
+        self.num_step = len(steps)
+        self.scene.set_scene(objects, info["cameras"], info["lamps"])
+        self.scene.view_directions = self.scene._compute_directions()
+        self.recorder.init(self.scene, self.current_idx)
+        self.record()
+        slots = [role["obj_idx"] for role in plan["roles"]]
+        if (
+            self.replay_steps({"steps": steps}, slots)
+            and self.validate_observability()
+        ):
+            self.info("* Canonical replay is valid.")
+            return self.recorder
+        self.warning("[Order] Canonical replay is invalid, dropping it.")
+        return None
+
+    def choose_core(self, info):
+        # Distractors that recur in every member: visible non-targets of the
+        # anchor that are not occluded in its initial images. Returns their
+        # indices in the anchor, or None if there are too few.
+        n_core = self.config.min_sample_shared_objects
+        if not self.group_mode or n_core == 0:
+            return []
+        unique = self.unique_indices(info)
+        candidates = [
+            i
+            for i in group.unoccluded_candidates(
+                info, self.scene.option.is_visible, self.initial_cameras
+            )
+            if i in unique
+        ]
+        if len(candidates) < n_core:
+            self.warning(
+                "[Fail] {} shared distractors needed, {} available.".format(
+                    n_core, len(candidates)
+                )
+            )
+            return None
+        return random.sample(candidates, n_core)
+
+    def unique_indices(self, info):
+        # Distractors must be unique, so that each one passes the decoder's
+        # "occurs once in every member" test like a target.
+        return group.unique_key_indices(
+            info["states"][0]["objects"], self.config.replay_keep_size
+        )
+
+    def in_targets(self, info):
+        return set(
+            trans["obj_idx"]
+            for trans in info["transformations"]
+            if trans.get("type") == "in"
+        )
+
+    def decoy_options(self, objects, idx):
+        option = self.scene.option
+        moves = group.in_move_options(
+            objects,
+            idx,
+            option.move_options,
+            option.is_position_valid,
+            option.is_visible,
+            option.original_coordinate,
+            option.size,
+        )
+        return moves
+
+    def decoy_candidates(self, info):
+        # Invisible non-targets of the anchor with a unique descriptor and an
+        # in-move. Returns [(index, moves)].
+        objects = info["states"][0]["objects"]
+        unique = self.unique_indices(info)
+        targets = group.target_indices(info)
+        result = []
+        for i, obj in enumerate(objects):
+            if (
+                i in targets
+                or i not in unique
+                or self.scene.option.is_visible(*obj["position"])
+            ):
+                continue
+            moves = self.decoy_options(objects, i)
+            if moves:
+                result.append((i, moves))
+        return result
+
+    def choose_decoys(self, info):
+        # Invisible distractors that recur in every member, each with an
+        # in-move (direction, step) of its own that enters the view in every
+        # member, so that an in-target is not the only object that could be
+        # moved in. In the anchor they are re-placed: invisible objects are
+        # never rendered, so a new start changes no image. Each start is
+        # chosen so that its move enters the view onto a free cell, off every
+        # cell the targets take during the transformation.
+        # Returns ([(index in the anchor, move)], stage-0 objects with the new
+        # starts, or None if nothing changes), or None if it fails.
+        n_in = self.config.min_invisible_distractors
+        if not self.group_mode or n_in == 0:
+            return [], None
+        n_core = n_in - len(self.in_targets(info))
+        option = self.scene.option
+        states = info["states"]
+        objects = [dict(obj) for obj in states[0]["objects"]]
+        unique = self.unique_indices(info)
+        targets = group.target_indices(info)
+        candidates = [
+            i
+            for i, obj in enumerate(objects)
+            if i not in targets
+            and i in unique
+            and not option.is_visible(*obj["position"])
+        ]
+        if len(candidates) < n_core:
+            self.warning(
+                "[Fail] {} invisible distractors needed, {} available.".format(
+                    n_core, len(candidates)
+                )
+            )
+            return None
+        chosen = random.sample(candidates, n_core)
+        # Moves are drawn independently of the in-targets' moves (a decoy
+        # that never shared the target's direction would single it out).
+        moves = [
+            (direction, step)
+            for _, _, direction, step in sorted(option.move_options)
+        ]
+
+        # Occupancy: the other objects at stage 0 and the targets at every
+        # stage.
+        option.reset()
+        for i, obj in enumerate(objects):
+            if i not in chosen:
+                x, y = obj["position"]
+                option.record_obj_addition(x, y, option.get_size(obj["size"]))
+        for state in states[1:]:
+            for i in targets:
+                obj = state["objects"][i]
+                x, y = obj["position"]
+                option.record_obj_addition(x, y, option.get_size(obj["size"]))
+
+        decoys = []
+        for idx in chosen:
+            radius = option.get_size(objects[idx]["size"])
+            for move in random.sample(moves, len(moves)):
+                dx, dy = option.get_delta_position(*move)
+                position = option.random_trajectory_start(
+                    radius, [(0, 0, False), (dx, dy, True)], [(dx, dy)]
+                )
+                if position is not None:
+                    break
+            else:
+                self.warning("[Fail] No start for decoy {}.".format(idx))
+                return None
+            x, y = position
+            option.record_obj_addition(x, y, radius)
+            option.record_obj_addition(x + dx, y + dy, radius)
+            objects[idx]["position"] = (x, y)
+            decoys.append((idx, move))
+        for idx, move in decoys:
+            if move not in self.decoy_options(objects, idx):
+                self.warning("[Fail] Decoy {} can not move in.".format(idx))
+                return None
+        return decoys, objects
+
+    def build_members(self, core, decoys):
+        # Replay the transformation of the anchor (self.recorder) on new
+        # initial scenes.
+        if not self.group_mode:
+            return True
+        anchor_info = self.recorder.info
+        plan = self.extract_plan(anchor_info)
+        for member in range(1, self.config.n_per_trans):
+            self.logger.info("---")
+            self.current_member = member
+            self.set_seed(member)
+            self.recorder = Recorder()
+            self.recorders.append(self.recorder)
+            if not self.build_replay(
+                plan, anchor_info, member, core, decoys
+            ):
+                return False
         return True
 
     def render_group(self, infos):
@@ -400,22 +679,29 @@ class Renderer:
                 )
             )
 
-        # Replays check the whole sample, so the anchor has to pass the same.
-        if self.group_mode and not self.validate_observability():
+        # The per-step checks miss some occlusions, so check the whole sample.
+        if not self.validate_observability():
             return False
 
         return True
 
-    def build_replay(self, plan, anchor_info, member):
+    def build_replay(self, plan, anchor_info, member, core, decoys):
         self.num_step = len(plan["steps"])
         for attempt in range(1, self.config.replay_max_tries + 1):
             self.n_replay_try += 1
             self.current_stage = 0
-            slots = self.sample_replay_state(plan, anchor_info, member)
+            slots = self.sample_replay_state(
+                plan, anchor_info, member, core, decoys
+            )
             if slots is None:
                 continue
             self.record()
-            if self.occluded_at_init(slots):
+            core_slots = [
+                shared["obj_idx"]
+                for shared in self.recorder.info["shared_objs"]
+                if shared["core"]
+            ]
+            if self.occluded_at_init(slots + core_slots):
                 continue
             if not self.replay_steps(plan, slots):
                 continue
@@ -429,7 +715,7 @@ class Renderer:
         )
         return False
 
-    def sample_replay_state(self, plan, anchor_info, member):
+    def sample_replay_state(self, plan, anchor_info, member, core, decoys):
         self.info("Start to building replay state.")
         self.scene.reset()
         if self.config.replay_share_jitter:
@@ -463,11 +749,74 @@ class Renderer:
             option.record_obj_addition(position[0], position[1], radius)
             targets.append((size, position))
 
+        # Copy visible non-target objects of the anchor, so that targets are
+        # not the only objects the members have in common: the core ones
+        # into every member, and up to (max - min) further ones per member.
+        anchor_objects = anchor_info["states"][0]["objects"]
+        unique = self.unique_indices(anchor_info)
+        rest = [
+            i
+            for i in group.shared_candidates(anchor_info, option.is_visible)
+            if i not in core and i in unique
+        ]
+        n_extra = random.randint(
+            0,
+            min(len(rest), self.config.max_sample_shared_objects - len(core)),
+        )
+        shared = []
+        for anchor_idx in core + random.sample(rest, n_extra):
+            radius = option.get_size(anchor_objects[anchor_idx]["size"])
+            position = option.random_position(radius, True)
+            if position is None:
+                self.warning("[Fail] No position for a shared object.")
+                return None
+            option.record_obj_addition(position[0], position[1], radius)
+            shared.append((anchor_idx, position))
+        n_shared = len(shared)
+
+        # Copy invisible non-targets of the anchor (decoys) the same way: the
+        # core ones with the group's in-move, further ones with a move drawn
+        # here. Each starts where its move would enter the view onto a free
+        # cell; the cell is reserved so that other objects stay off it.
+        core_decoys = [idx for idx, _ in decoys]
+        rest = [
+            candidate
+            for candidate in self.decoy_candidates(anchor_info)
+            if candidate[0] not in core_decoys
+        ]
+        n_extra = random.randint(
+            0,
+            min(
+                len(rest),
+                self.config.max_invisible_distractors
+                - self.config.min_invisible_distractors,
+            ),
+        )
+        hidden = []
+        for anchor_idx, move in decoys + [
+            (idx, random.choice(moves))
+            for idx, moves in random.sample(rest, n_extra)
+        ]:
+            radius = option.get_size(anchor_objects[anchor_idx]["size"])
+            dx, dy = option.get_delta_position(*move)
+            position = option.random_trajectory_start(
+                radius, [(0, 0, False), (dx, dy, True)], [(dx, dy)]
+            )
+            if position is None:
+                self.warning("[Fail] No position for an invisible decoy.")
+                return None
+            x, y = position
+            option.record_obj_addition(x, y, radius)
+            option.record_obj_addition(x + dx, y + dy, radius)
+            hidden.append((anchor_idx, position, move))
+
         # Decide the visibilities of objects.
         n_vis_targets = len([r for r in roles if r["constraints"][0][2]])
         n_invis_targets = len(roles) - n_vis_targets
-        low = max(self.config.min_init_vis, n_vis_targets)
-        high = min(self.config.max_init_vis, total_obj - n_invis_targets)
+        low = max(self.config.min_init_vis, n_vis_targets + n_shared)
+        high = min(
+            self.config.max_init_vis, total_obj - n_invis_targets - len(hidden)
+        )
         if low > high:
             self.warning("[Fail] No valid number of visible objects.")
             return None
@@ -488,9 +837,36 @@ class Renderer:
             )
             free_slots.remove(slot)
             slots.append(slot)
+        shared_slots = random.sample(
+            [i for i in free_slots if visible_choices[i]], n_shared
+        )
+        self.recorder.info["shared_objs"] = [
+            {
+                "obj_idx": slot,
+                "anchor_idx": anchor_idx,
+                "core": anchor_idx in core,
+            }
+            for slot, (anchor_idx, _) in zip(shared_slots, shared)
+        ]
+        hidden_slots = random.sample(
+            [i for i in free_slots if not visible_choices[i]], len(hidden)
+        )
+        self.recorder.info["decoy_objs"] = [
+            {
+                "obj_idx": slot,
+                "anchor_idx": anchor_idx,
+                "core": anchor_idx in core_decoys,
+                "move": list(move),
+            }
+            for slot, (anchor_idx, _, move) in zip(hidden_slots, hidden)
+        ]
 
-        # Other objects must not share a descriptor with a target.
-        exclude = set(role["key"] for role in roles)
+        # Other objects must not share a descriptor with a target or a copy.
+        copies = [idx for idx, _ in shared] + [idx for idx, _, _ in hidden]
+        exclude = set(role["key"] for role in roles) | set(
+            group.obj_key(anchor_objects[idx], self.config.replay_keep_size)
+            for idx in copies
+        )
 
         def key_fn(attrs):
             return group.obj_key(attrs, self.config.replay_keep_size)
@@ -507,6 +883,21 @@ class Renderer:
                     y,
                     role["desc"]["material"],
                     role["desc"]["color"],
+                )
+            elif i in shared_slots or i in hidden_slots:
+                if i in shared_slots:
+                    anchor_idx, (x, y) = shared[shared_slots.index(i)]
+                else:
+                    anchor_idx, (x, y), _ = hidden[hidden_slots.index(i)]
+                anchor_obj = anchor_objects[anchor_idx]
+                _, obj = self.scene.add_object(
+                    anchor_obj["shape"],
+                    anchor_obj["size"],
+                    option.random_rotation(),
+                    x,
+                    y,
+                    anchor_obj["material"],
+                    anchor_obj["color"],
                 )
             else:
                 obj = self.scene.create_random_object(
@@ -529,20 +920,34 @@ class Renderer:
                     obj["material"],
                     obj["shape"],
                     *obj["position"],
-                    " (target)" if i in slots else ""
+                    " (target)"
+                    if i in slots
+                    else " (shared)"
+                    if i in shared_slots
+                    else " (decoy)"
+                    if i in hidden_slots
+                    else ""
                 )
             )
+
+        # Each decoy's move must still end on a free cell.
+        objects = self.scene.objects_description
+        for slot, (_, _, move) in zip(hidden_slots, hidden):
+            if tuple(move) not in self.decoy_options(objects, slot):
+                self.warning("[Fail] Decoy {} can not move in.".format(slot))
+                return None
 
         return slots
 
     def occluded_at_init(self, slots):
-        # Rule 1. Occluded objects can not be transformed.
+        # Rule 1. Occluded objects can not be transformed. Core distractors
+        # must be seen in every member too.
         status = self.recorder.info["states"][0]["status"]
         for slot in slots:
             name = self.scene.get_name(self.scene.objects[slot])
             for cam in self.initial_cameras:
                 if status[cam][name] == "occluded":
-                    self.warning("[Fail] target {} is occluded.".format(slot))
+                    self.warning("[Fail] object {} is occluded.".format(slot))
                     return True
         return False
 
@@ -680,15 +1085,23 @@ class Renderer:
         else:
             choices = self.get_non_occluded_objs()
 
+        # A second edit of the same attribute would hide the first one.
+        attr = pair.split(self.scene.option.SPLIT)[0]
+        if attr != "position":
+            choices = [
+                obj for obj in choices if not self.was_transformed(obj, attr)
+            ]
+        else:
+            choices = [obj for obj in choices if self.can_move(obj)]
+
         choices = [self.scene.get_index(obj) for obj in choices]
 
-        # Replays identify targets by their descriptor, so it must be unique.
-        if self.group_mode:
-            unique = group.unique_key_indices(
-                self.recorder.info["states"][0]["objects"],
-                self.config.replay_keep_size,
-            )
-            choices = [idx for idx in choices if idx in unique]
+        # Steps name their target by its descriptor, so it must be unique.
+        unique = group.unique_key_indices(
+            self.recorder.info["states"][0]["objects"],
+            self.config.replay_keep_size,
+        )
+        choices = [idx for idx in choices if idx in unique]
 
         return choices
 
@@ -744,6 +1157,14 @@ class Renderer:
             )
             return False, response
 
+        # Several moves of one object must not cancel out.
+        init_obj = self.recorder.info["states"][0]["objects"][
+            self.scene.get_index(obj)
+        ]
+        if (new_x, new_y) == tuple(init_obj["position"]):
+            self.warning("[Fail] move back to the initial position.")
+            return False, response
+
         vis_old = self.scene.option.is_visible(x, y)
         vis_new = self.scene.option.is_visible(new_x, new_y)
 
@@ -774,6 +1195,8 @@ class Renderer:
 
         if self.scene.is_overlapped(obj):
             self.warning("[Fail] Overlap.")
+        elif self.takes_in_candidate(obj) is not None:
+            self.warning("[Fail] Takes a candidate of a moved-in object.")
         # Rule 3. Transformed objects can not be occluded.
         elif self.cause_occlusion(obj):
             self.warning("[Fail] Cause occlusion.")
@@ -784,6 +1207,8 @@ class Renderer:
                 )
             else:
                 response["options"].append((direction, step))
+            if response["type"] == "in":
+                response["candidates"] = self.in_candidates(obj, x, y)
             return True, response
 
         # Revert.
@@ -820,10 +1245,11 @@ class Renderer:
 
         self.scene.set_size(obj, new_size)
 
-        if self.scene.option.is_bigger(
-            new_size, old_size
-        ) and self.scene.is_overlapped(obj):
+        grows = self.scene.option.is_bigger(new_size, old_size)
+        if grows and self.scene.is_overlapped(obj):
             self.warning("[Fail] Overlap.")
+        elif grows and self.takes_in_candidate(obj) is not None:
+            self.warning("[Fail] Takes a candidate of a moved-in object.")
         # Rule 3. transformed objects can not be occluded (visible in final states)
         elif self.cause_occlusion(obj):
             self.warning("[Fail] Cause occlusion.")
@@ -988,6 +1414,61 @@ class Renderer:
                 return True
         return False
 
+    def move_types(self, obj):
+        return [
+            trans_info["type"]
+            for trans_info in self.recorder.info["transformations"]
+            if obj.name == trans_info["obj_name"]
+            and trans_info["attr"] == "position"
+        ]
+
+    def can_move(self, obj):
+        # The grammar does not follow an object after an in- or out-move, and
+        # several moves of one object can add up to a single one.
+        types = self.move_types(obj)
+        if "in" in types or "out" in types:
+            return False
+        return len(types) == 0 or self.config.allow_repeated_moves
+
+    def footprint(self, obj, position=None):
+        desc = dict(self.scene.describe(obj))
+        if position is not None:
+            desc["position"] = position
+        option = self.scene.option
+        return group.footprint(desc, option.original_coordinate, option.size)
+
+    def in_candidates(self, obj, x, y):
+        # The grammar's 'in' has no direction, so afterwards the object is
+        # only known to be at one of the free destinations of in-moves from
+        # its start (x, y).
+        option = self.scene.option
+        min_gap = option.original_coordinate["min_gap"]
+        others = [self.footprint(o) for o in self.scene.objects if o != obj]
+        cells = []
+        for direction, step in option.get_move_options(x, y)["visible"]:
+            dx, dy = option.get_delta_position(direction, step)
+            cell = self.footprint(obj, (x + dx, y + dy))
+            if not any(group.overlaps(cell, o, min_gap) for o in others):
+                cells.append((x + dx, y + dy))
+        return sorted(cells)
+
+    def takes_in_candidate(self, obj):
+        # No other object may later overlap a cell where a moved-in object may
+        # be. Returns the index of the moved-in object, or None.
+        idx = self.scene.get_index(obj)
+        min_gap = self.scene.option.original_coordinate["min_gap"]
+        obj_footprint = self.footprint(obj)
+        for trans_info in self.recorder.info["transformations"]:
+            if trans_info.get("type") != "in" or trans_info["obj_idx"] == idx:
+                continue
+            moved_in = self.scene.objects[trans_info["obj_idx"]]
+            for cell in trans_info["candidates"]:
+                if group.overlaps(
+                    obj_footprint, self.footprint(moved_in, cell), min_gap
+                ):
+                    return trans_info["obj_idx"]
+        return None
+
     def clear_history(self):
         self.logger.info("Removing files after failed...")
         for recorder in self.recorders:
@@ -1027,7 +1508,21 @@ class Renderer:
                 state["stage_success"], state["rate_stage_success"]
             )
         )
+        self.logger.info(
+            "Canonical replay invalid (transformations dropped): {}".format(
+                self.n_canonical_fail
+            )
+        )
         if self.group_mode:
+            self.logger.info(
+                "Too few core distractors (transformations dropped): "
+                "{}".format(self.n_core_fail)
+            )
+            self.logger.info(
+                "Too many in-targets (transformations dropped): {}".format(
+                    self.n_in_fail
+                )
+            )
             self.logger.info(
                 "Replay attempts: {} (transformations dropped: {})".format(
                     self.n_replay_try, self.n_replay_fail

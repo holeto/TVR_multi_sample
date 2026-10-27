@@ -12,10 +12,15 @@ min_init_vis: 1 # The minimum number of visible objects in the initial states.
 max_init_vis: 10 # The maximum number of visible objects in the initial states.
 min_trans: 1 # The minimum number of transformations between initial and final states.
 max_trans: 4 # The maximum number of transformations between initial and final states.
+allow_repeated_moves: false # If true, an object may be moved several times (inner moves only), so that several moves can add up to a single one; they may not bring it back to its start. Objects moved in or out are never moved again.
 n_per_trans: 1 # The number of samples (members) per transformation. Members after the first replay its transformation on new initial scenes.
 replay_keep_size: true # If true, target objects keep their size across members. If false, only color, material and shape identify them.
 replay_share_jitter: false # If true, members reuse the camera and lamp positions of the first member.
 replay_max_tries: 50 # The number of scene attempts per member before the whole transformation is resampled.
+min_sample_shared_objects: 0 # The number of visible non-target objects of the first member (core distractors, not occluded in its initial images) that are copied (same attributes, new position) into every other member, where they must not be occluded either. A transformation whose first member has fewer is resampled.
+max_sample_shared_objects: 0 # The maximum number of copied objects per member: each other member also gets between 0 and (max - min) further copies of the first member's visible non-target objects, drawn per member.
+min_invisible_distractors: 0 # The number of objects that can move in, the same in every transformation: its in-targets plus core decoys (invisible non-target objects of the first member, re-placed there, copied into every other member, each with an in-move of its own that enters the view onto a free cell in every member). Transformations with this many in-targets or more are resampled, as are those whose first member has too few invisible non-targets.
+max_invisible_distractors: 0 # Each other member also gets between 0 and (max - min) further decoys, each with an in-move of its own.
 
 width: 320 # The width of rendering images (in pixels).
 height: 240 # The height of rendering images (in pixels).

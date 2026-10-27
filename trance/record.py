@@ -179,8 +179,11 @@ class SampleManager:
 
         self.reset(stage=False)
 
-    def sample_fail(self):
-        self.n_init_vis[self.init_vis] -= 1
+    def sample_fail(self, keep_init_vis=False):
+        # keep_init_vis: the number of initial visible objects stays counted
+        # as used, so that the balanced sampler moves on from it.
+        if not keep_init_vis:
+            self.n_init_vis[self.init_vis] -= 1
         self.n_step[self.step] -= 1
         self.record_seq_trans(self.seq_trans, addition=False)
         self.c_sample_fail += 1

@@ -171,3 +171,285 @@ def test_occluded_targets():
     # Object_2 is not a target, so its occlusion does not matter.
     info["states"][0]["status"]["C"]["Object_2"] = "occluded"
     assert group.occluded_targets(info, ["C"], ["C", "L"]) == [(1, 3, "L")]
+
+
+def make_plan(keys, steps):
+    return {"roles": [{"key": key} for key in keys], "steps": steps}
+
+
+def test_canonical_steps_sorts_commuting_steps():
+    # Recolors of different objects come out in key order.
+    plan = make_plan(
+        ["red_cube", "blue_cube"],
+        [(0, "color.green", None), (1, "color.yellow", None)],
+    )
+    assert group.canonical_steps(plan) == [
+        (1, "color.yellow", None),
+        (0, "color.green", None),
+    ]
+    # Edits of different attributes of one object are sorted by pair.
+    plan = make_plan(
+        ["red_cube"], [(0, "shape.sphere", None), (0, "color.blue", None)]
+    )
+    assert group.canonical_steps(plan) == [
+        (0, "color.blue", None),
+        (0, "shape.sphere", None),
+    ]
+
+
+def test_canonical_steps_keeps_dependent_steps():
+    # Edits of an object moved in stay after the move, even if they sort
+    # first.
+    steps = [(0, "position.right.1", "in"), (0, "color.blue", None)]
+    plan = make_plan(["red_cube"], steps)
+    assert group.canonical_steps(plan) == steps
+
+    # Steps of another object may be interleaved with the chain.
+    steps = [
+        (0, "position.right.1", "in"),
+        (0, "color.blue", None),
+        (1, "color.green", None),
+    ]
+    plan = make_plan(["red_cube", "blue_cube"], steps)
+    assert group.canonical_steps(plan) == [
+        (1, "color.green", None),
+        (0, "position.right.1", "in"),
+        (0, "color.blue", None),
+    ]
+
+
+def test_canonical_steps_sorts_steps_of_one_object():
+    # An edit and an inner move of one object give the same images in either
+    # order, and so do two inner moves.
+    for steps in [
+        [(0, "position.right.1", "inner"), (0, "color.blue", None)],
+        [(0, "color.blue", None), (0, "position.right.1", "inner")],
+    ]:
+        assert group.canonical_steps(make_plan(["red_cube"], steps)) == [
+            (0, "color.blue", None),
+            (0, "position.right.1", "inner"),
+        ]
+    steps = [
+        (0, "position.right.1", "inner"),
+        (0, "position.front.1", "inner"),
+    ]
+    assert group.canonical_steps(make_plan(["red_cube"], steps)) == [
+        (0, "position.front.1", "inner"),
+        (0, "position.right.1", "inner"),
+    ]
+
+
+def test_canonical_steps_sorts_by_abstract_pair():
+    # The direction of an out-move is not part of the canonical form.
+    keys = ["a", "b"]
+    for direction in ["behind", "front"]:
+        steps = [
+            (1, "color.blue", None),
+            (0, "position.{}.2".format(direction), "out"),
+        ]
+        assert group.canonical_steps(make_plan(keys, steps)) == [
+            steps[1],
+            steps[0],
+        ]
+
+
+def test_abstract_transformation():
+    assert group.abstract_pair("position.left.2", "out") == "position.out"
+    assert group.abstract_pair("position.left.2", "in") == "position.in"
+    assert group.abstract_pair("position.left.2", "inner") == (
+        "position.left.2"
+    )
+    assert group.abstract_pair("color.red", None) == "color.red"
+
+    info = make_info()
+    info["idx"] = info["trans_id"] = 7
+    for trans in info["transformations"]:
+        obj = info["states"][0]["objects"][trans["obj_idx"]]
+        trans["obj_key"] = group.obj_key(obj)
+        trans["obj_desc"] = group.obj_desc(obj)
+    abstract = group.abstract_transformation(info)
+    assert abstract["trans_id"] == 7
+    assert [s["pair"] for s in abstract["steps"]] == [
+        "position.right.1",
+        "position.in",
+        "size.small",
+    ]
+    assert abstract["steps"][1]["obj_key"] == "large_blue_metal_cube"
+    assert abstract["steps"][1]["obj_desc"]["color"] == "blue"
+
+
+def add_step(info, trans, objects):
+    info["transformations"].append(trans)
+    info["states"].append({"objects": objects})
+
+
+def test_move_violations():
+    info = make_info()
+    assert group.move_violations(info) == []
+    stage = info["states"][-1]["objects"]
+
+    # Object_1 was moved in, Object_0 was moved before.
+    moved_back = [make_obj("Object_0", (0, 0)), stage[1]]
+    add_step(
+        info,
+        {"obj_idx": 0, "attr": "position", "type": "inner"},
+        moved_back,
+    )
+    assert group.move_violations(info) == [(3, 0, "second move")]
+    assert group.move_violations(info, allow_repeated_moves=True) == [
+        (3, 0, "move back to the start")
+    ]
+    add_step(
+        info,
+        {"obj_idx": 1, "attr": "position", "type": "inner"},
+        [moved_back[0], make_obj("Object_1", (0, 10), "blue", size="small")],
+    )
+    assert group.move_violations(info, allow_repeated_moves=True)[1:] == [
+        (4, 1, "move after moving in")
+    ]
+
+    info = make_info()
+    info["transformations"][0]["type"] = "out"
+    info["states"][1]["objects"][0]["position"] = (0, 30)
+    add_step(
+        info,
+        {"obj_idx": 0, "attr": "position", "type": "in"},
+        [make_obj("Object_0", (0, 10)), stage[1]],
+    )
+    assert group.move_violations(info) == [(3, 0, "step after moving out")]
+
+
+def test_footprint_overlaps():
+    option = get_option()
+    coordinate, sizes = option.original_coordinate, option.size
+    large = group.footprint(make_obj("A", (0, 0)), coordinate, sizes)
+    assert large == ((0.0, 0.0), 0.9)
+    # Large + small + gap = 1.35 m = 9 grid units.
+    for x, expected in [(8, True), (10, False)]:
+        small = group.footprint(
+            make_obj("B", (x, 0), size="small"), coordinate, sizes
+        )
+        assert group.overlaps(large, small, coordinate["min_gap"]) == expected
+
+
+def test_candidate_conflicts():
+    option = get_option()
+    coordinate, sizes = option.original_coordinate, option.size
+    info = make_info()
+    # Object_1 (small after step 2) could have moved in to (-10, 0) or
+    # (-10, 20).
+    info["transformations"][1]["candidates"] = [(-10, 0), (-10, 20)]
+    assert group.candidate_conflicts(info, coordinate, sizes) == []
+
+    # Object_0 then moves next to the unused candidate (-10, 20).
+    stage = info["states"][-1]["objects"]
+    add_step(
+        info,
+        {"obj_idx": 0, "attr": "position", "type": "inner"},
+        [make_obj("Object_0", (-10, 28)), stage[1]],
+    )
+    assert group.candidate_conflicts(info, coordinate, sizes) == [(3, 0, 1)]
+
+    # Growing next to a candidate is a conflict too, shrinking is not.
+    for old, new, expected in [
+        ("small", "medium", [(3, 0, 1)]),
+        ("large", "medium", []),
+    ]:
+        info = make_info()
+        info["transformations"][1]["candidates"] = [(-10, 0), (-10, 20)]
+        stage = info["states"][-1]["objects"]
+        stage[0] = make_obj("Object_0", (-10, 24), size=old)
+        add_step(
+            info,
+            {"obj_idx": 0, "attr": "size"},
+            [make_obj("Object_0", (-10, 24), size=new), stage[1]],
+        )
+        assert group.candidate_conflicts(info, coordinate, sizes) == expected
+
+
+def test_canonical_steps_is_order_independent():
+    steps = [
+        (0, "position.right.1", "inner"),
+        (1, "size.small", None),
+        (2, "material.rubber", None),
+        (1, "color.blue", None),
+        (0, "position.front.2", "out"),
+    ]
+    plan = make_plan(["b", "a", "c"], steps)
+    result = group.canonical_steps(plan)
+    assert sorted(result) == sorted(steps)
+    # Any valid reordering of the same steps gives the same canonical order.
+    shuffled = [steps[i] for i in [2, 3, 0, 1, 4]]
+    assert group.canonical_steps(make_plan(["b", "a", "c"], shuffled)) == (
+        result
+    )
+
+
+def test_shared_candidates():
+    option = get_option()
+    info = make_info()
+    for state in info["states"]:
+        state["objects"].append(make_obj("Object_2", (0, -20), "green"))
+        state["objects"].append(make_obj("Object_3", (-30, 20), "gray"))
+    assert not option.is_visible(-30, 20)
+    # Object_0 and Object_1 are targets, Object_3 is invisible.
+    assert group.shared_candidates(info, option.is_visible) == [2]
+
+
+def test_unoccluded_candidates():
+    option = get_option()
+    info = make_info()
+    info["states"][0]["objects"].append(make_obj("Object_2", (0, -20), "gray"))
+    info["states"][0]["objects"].append(make_obj("Object_3", (10, 20), "cyan"))
+    for cam in ["C", "L"]:
+        info["states"][0]["status"][cam]["Object_2"] = "visible"
+        info["states"][0]["status"][cam]["Object_3"] = "visible"
+    info["states"][0]["status"]["L"]["Object_3"] = "occluded"
+    assert group.unoccluded_candidates(info, option.is_visible, ["C"]) == [
+        2,
+        3,
+    ]
+    assert group.unoccluded_candidates(
+        info, option.is_visible, ["C", "L"]
+    ) == [2]
+
+
+def test_in_move_options():
+    option = get_option()
+
+    def moves(objects, idx):
+        return group.in_move_options(
+            objects,
+            idx,
+            option.move_options,
+            option.is_position_valid,
+            option.is_visible,
+            option.original_coordinate,
+            option.size,
+        )
+
+    # From (-35, 0) only moves of 2 steps towards x > 0 enter the view.
+    objects = [make_obj("Object_0", (-35, 0), size="small")]
+    assert moves(objects, 0) == [
+        ("behind", 2),
+        ("behind-left", 2),
+        ("behind-right", 2),
+    ]
+    # An object next to the destination of behind.2 blocks it.
+    objects.append(make_obj("Object_1", (-15, 4), size="small"))
+    assert ("behind", 2) not in moves(objects, 0)
+    # A visible object has no in-move.
+    assert moves([make_obj("Object_0", (0, 0))], 0) == []
+
+
+def test_repeated_attr_steps():
+    info = make_info()
+    assert group.repeated_attr_steps(info) == []
+    info["transformations"].append(
+        {"obj_idx": 0, "attr": "position", "pair": "position.left.1"}
+    )
+    assert group.repeated_attr_steps(info) == []
+    info["transformations"].append(
+        {"obj_idx": 1, "attr": "size", "pair": "size.large"}
+    )
+    assert group.repeated_attr_steps(info) == [(4, 1, "size")]
