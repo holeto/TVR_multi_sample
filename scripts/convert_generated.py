@@ -8,9 +8,15 @@ Here every sample becomes one line with a unique `idx`, and splits are made per
 transformation, so that samples of one transformation never end up in
 different splits.
 
+Several generator directories can be given, e.g. the parts of a run split
+over parallel processes (disjoint index ranges, `--start`/`--n_sample`); they
+are merged into one dataset.
+
 Example:
     python scripts/convert_generated.py /data/trance_gen/standard \
         /data/trance_multi --preprocess
+    python scripts/convert_generated.py /data/gen/parts/*/center_1step \
+        /data/trance_center_1step --split-ratio 125000 2500 5000 --preprocess
 """
 import argparse
 import json
@@ -80,15 +86,38 @@ def convert_sample(info, idx):
     }
 
 
-def load_groups(info_dir):
+def load_groups(gen_dirs):
+    """Samples of the generator directories, grouped by transformation.
+
+    Returns (groups, sources): groups maps trans_id to its samples sorted by
+    member, sources maps trans_id to the directory it was read from.
+    """
     groups = defaultdict(list)
-    for path in sorted(Path(info_dir).glob("*.json")):
-        with open(path, "r") as f:
-            info = json.load(f)
-        groups[info.get("trans_id", info["idx"])].append(info)
+    sources = {}
+    seen = set()
+    for gen_dir in gen_dirs:
+        for path in sorted(Path(gen_dir, "info").glob("*.json")):
+            with open(path, "r") as f:
+                info = json.load(f)
+            trans_id = info.get("trans_id", info["idx"])
+            member = info.get("member", 0)
+            # Overlapping index ranges, or a directory given twice, would
+            # duplicate samples. Images are read from one directory per
+            # transformation, so it must not be split over directories.
+            if (trans_id, member) in seen:
+                raise ValueError(
+                    f"sample {trans_id}.{member} found twice ({gen_dir})"
+                )
+            if sources.setdefault(trans_id, gen_dir) != gen_dir:
+                raise ValueError(
+                    f"transformation {trans_id} is in both "
+                    f"{sources[trans_id]} and {gen_dir}"
+                )
+            seen.add((trans_id, member))
+            groups[trans_id].append(info)
     for members in groups.values():
         members.sort(key=lambda info: info.get("member", 0))
-    return groups
+    return groups, sources
 
 
 def split_transformations(trans_ids, ratios):
@@ -112,8 +141,8 @@ def split_transformations(trans_ids, ratios):
     return result
 
 
-def convert(gen_dir, dataroot, ratios, split_names, force=False):
-    gen_dir = Path(gen_dir)
+def convert(gen_dirs, dataroot, ratios, split_names, force=False):
+    gen_dirs = [Path(gen_dir) for gen_dir in gen_dirs]
     dataroot = Path(dataroot)
     data_path = dataroot / "data.jsonl"
     image_dir = dataroot / "image"
@@ -121,7 +150,7 @@ def convert(gen_dir, dataroot, ratios, split_names, force=False):
         raise FileExistsError(f"{data_path} exists, use --force.")
     image_dir.mkdir(parents=True, exist_ok=True)
 
-    groups = load_groups(gen_dir / "info")
+    groups, sources = load_groups(gen_dirs)
     sizes = sorted(set(len(members) for members in groups.values()))
     print(f"Transformations: {len(groups)}, samples per one: {sizes}")
 
@@ -140,6 +169,7 @@ def convert(gen_dir, dataroot, ratios, split_names, force=False):
         )
 
     for sample in samples:
+        gen_dir = sources[sample["trans_id"]]
         for state in (sample["states"][0], sample["states"][-1]):
             for image in state["images"].values():
                 src = gen_dir / "image" / image
@@ -164,7 +194,9 @@ def convert(gen_dir, dataroot, ratios, split_names, force=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("gen_dir", help="<output_data_dir>/<problem>")
+    parser.add_argument(
+        "gen_dirs", nargs="+", help="one or more <output_data_dir>/<problem>"
+    )
     parser.add_argument("dataroot")
     parser.add_argument(
         "--split-name", nargs="+", default=["train", "val", "test"]
@@ -180,7 +212,7 @@ if __name__ == "__main__":
     assert len(args.split_name) == len(args.split_ratio)
 
     n_samples = convert(
-        args.gen_dir,
+        args.gen_dirs,
         args.dataroot,
         args.split_ratio,
         args.split_name,
