@@ -184,7 +184,10 @@ class SampleManager:
         # as used, so that the balanced sampler moves on from it.
         if not keep_init_vis:
             self.n_init_vis[self.init_vis] -= 1
-        self.n_step[self.step] -= 1
+        # A failed initial state comes before the number of steps is drawn;
+        # step is then still 0 from reset(), which is not a key of n_step.
+        if self.step in self.n_step:
+            self.n_step[self.step] -= 1
         self.record_seq_trans(self.seq_trans, addition=False)
         self.c_sample_fail += 1
         self.t_total_fail += time.time() - self.t_sample
