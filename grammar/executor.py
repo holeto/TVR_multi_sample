@@ -6,11 +6,20 @@ position), and decides which steps (R, A) are valid in every member.
 ProgramExecutor works without init_desc: it judges a step only by the program
 decoded so far (see its docstring for what that still covers).
 
-Positions are sets of cells. A plain object has one cell. After 'in' it is the
-set P(o) of candidate cells, after 'out' the set of possible destinations.
-Such sets are permissive: they block a step only if every cell blocks it. The
-candidate cells of 'in' are also reserved: other objects must avoid all of
-them, because the generator enforces exactly that.
+Positions are sets of cells. A plain object has one cell. After 'in' or
+'out' it is the set of possible destinations of a move of that kind. Such
+sets are permissive: they block a step only if every cell blocks it. The
+candidate cells P(o) of 'in' are also reserved: other objects must avoid all
+of them, because the generator enforces exactly that.
+
+Two collision tests are kept apart, as in the generator (see geometry.py).
+Moves, including the move of 'in' itself, and size changes use
+Geometry.collides (exact contact is free), so the destinations of 'in' and
+'out' (Obj.cells) are judged by it. P(o) and the reservation use
+Geometry.overlaps, as Renderer.in_candidates does; P(o) may therefore miss a
+destination at exact contact. P(o) sees moved objects at their float-test
+cells (Obj.float_cells), so the reserved sets stay what they were before
+collides existed.
 """
 from .cfg import COLORS, DIRECTIONS, MATERIALS, SHAPES, SIZES, STEPS
 
@@ -60,6 +69,10 @@ class Obj:
         self.start = tuple(desc["position"])
         self.size = desc["size"]
         self.cells = [self.start]
+        # Only for a moved-in or moved-out object: its destinations under the
+        # float test (cells holds those under the exact one, a superset); for
+        # 'in' they are P(o). None otherwise.
+        self.float_cells = None
         self.edited = set()
         self.status = UNTOUCHED
         self.moved = False
@@ -87,16 +100,19 @@ class Member:
             return False
         return self.geometry.visible(o.cells[0])
 
-    def blocked(self, idx, cell, size, reserved=True):
-        """Whether object idx would collide at cell with the given size."""
+    def blocked(self, idx, cell, size, reserved=True, exact=True):
+        """Whether object idx would collide at cell with the given size.
+        exact=False uses the generator's float test, as for 'in' candidates;
+        reserved cells are always judged by it."""
         geometry = self.geometry
+        test = geometry.collides if exact else geometry.overlaps
         for j, other in enumerate(self.objects):
             if j == idx:
                 continue
-            if all(
-                geometry.overlaps(cell, size, c, other.size)
-                for c in other.cells
-            ):
+            cells = other.cells
+            if not exact and other.float_cells is not None:
+                cells = other.float_cells
+            if all(test(cell, size, c, other.size) for c in cells):
                 return True
         if reserved:
             for owner, cells in self.reserved.items():
@@ -109,9 +125,9 @@ class Member:
                     return True
         return False
 
-    def free_moves(self, idx, visible):
+    def free_moves(self, idx, visible, exact=True):
         """Moves of object idx from its cell whose destination is on the grid,
-        has the given visibility and is free."""
+        has the given visibility and is free (see blocked for exact)."""
         o = self.objects[idx]
         result = set()
         for move in self.geometry.moves:
@@ -119,7 +135,7 @@ class Member:
             if (
                 self.geometry.on_grid(cell)
                 and self.geometry.visible(cell) == visible
-                and not self.blocked(idx, cell, o.size)
+                and not self.blocked(idx, cell, o.size, exact=exact)
             ):
                 result.add(move)
         return result
@@ -160,6 +176,17 @@ class Member:
             and not self.blocked(idx, cell, o.size)
         )
 
+    def free_in_cell(self, idx, move, exact):
+        # Whether the in-move of object idx from its start ends on the grid,
+        # in view and clear of the other objects (reserved cells ignored).
+        o = self.objects[idx]
+        cell = self.geometry.destination(o.start, move)
+        return (
+            self.geometry.on_grid(cell)
+            and self.geometry.visible(cell)
+            and not self.blocked(idx, cell, o.size, reserved=False, exact=exact)
+        )
+
     def moves_for(self, idx, kind):
         """Feasible (direction, n) of an 'in' or 'out' of object idx."""
         return self.free_moves(idx, visible=(kind == "in"))
@@ -174,26 +201,33 @@ class Member:
                 o.size = parts[1]
             o.status = MOVED_IN if o.status == MOVED_IN else TOUCHED
         elif parts[1] == "in":
-            # Candidates: every feasible in-move, judged against the objects
-            # only, as the generator does.
-            cells = []
-            for move in self.geometry.moves:
-                cell = self.geometry.destination(o.start, move)
-                if (
-                    self.geometry.on_grid(cell)
-                    and self.geometry.visible(cell)
-                    and not self.blocked(idx, cell, o.size, reserved=False)
-                ):
-                    cells.append(cell)
-            o.cells = sorted(set(cells))
+            # The generator accepts the move by the exact test, but records
+            # and reserves only the cells free by the float test, P(o). Both
+            # are judged against the objects only, as in_candidates does.
+            exact_cells, float_cells = (
+                sorted(
+                    set(
+                        self.geometry.destination(o.start, move)
+                        for move in self.geometry.moves
+                        if self.free_in_cell(idx, move, exact=flag)
+                    )
+                )
+                for flag in (True, False)
+            )
+            o.cells, o.float_cells = exact_cells, float_cells
             o.status = MOVED_IN
             o.moved = True
-            self.reserved[idx] = o.cells
+            self.reserved[idx] = float_cells
         elif parts[1] == "out":
-            o.cells = sorted(
-                self.geometry.destination(o.cells[0], move)
-                for move in self.free_moves(idx, visible=False)
+            start = o.cells[0]
+            exact_cells, float_cells = (
+                sorted(
+                    self.geometry.destination(start, move)
+                    for move in self.free_moves(idx, False, exact=flag)
+                )
+                for flag in (True, False)
             )
+            o.cells, o.float_cells = exact_cells, float_cells
             o.status = MOVED_OUT
             o.moved = True
         else:

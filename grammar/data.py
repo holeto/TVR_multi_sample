@@ -69,6 +69,9 @@ def _commute(step_a, step_b):
     """Steps commute unless they are of one object and one is its in/out."""
     (desc_a, action_a), (desc_b, action_b) = step_a, step_b
     moves = ("position.in", "position.out")
+    #TODO: Does resizing commute? We can resize and object
+    # such that it would overlap with others making it illegal action,
+    # but moving it away first could make the move legal.
     return desc_a != desc_b or (action_a not in moves and action_b not in moves)
 
 

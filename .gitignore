@@ -146,3 +146,6 @@ cython_debug/
 
 # vim
 *.swp
+
+#Coding agents stuff
+.claude/

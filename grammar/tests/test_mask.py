@@ -4,6 +4,7 @@ Grid units: the visible square is |x|, |y| <= 20, one move step is 10 units,
 and two objects overlap when their centres are closer than r_a + r_b + gap
 (large 6, medium 4, small 2 units of radius, gap 1).
 """
+import json
 import os
 import random
 import sys
@@ -12,6 +13,7 @@ import pytest
 
 from grammar import Geometry, MaskedDecoder, cfg
 from grammar.data import canonical_order
+from grammar.geometry import PROPERTIES_JSON
 
 GEOMETRY = Geometry()
 
@@ -175,6 +177,170 @@ def test_moved_in_object_grows_where_some_candidate_fits():
     members[0].append(obj(("large", "gray", "glass", "cube"), [-15, -30]))
     d = decoder(members, [(W, "position.in")])
     assert "size.large" not in actions(d, W)
+
+
+# --- exact contact ---------------------------------------------------------
+
+# Blender lets two objects stand at exactly r_a + r_b + gap, but the float
+# test of Geometry.overlaps may call that an overlap (a 3-4-5 offset of small
+# objects gives 0.7499999999999998 m against the limit 0.75 m). The checks that
+# follow the generator's Blender test must allow contact, including where a
+# moved-in object may land; the candidates P(o) and reservation of 'in' must
+# not.
+
+
+def collides_by(geometry, a, size_a, b, size_b):
+    dx, dy = a[0] - b[0], a[1] - b[1]
+    limit = geometry.cell_sizes[size_a] + geometry.cell_sizes[size_b] + 1
+    return dx * dx + dy * dy, limit * limit
+
+
+def test_collides_differs_from_overlaps_only_at_contact():
+    anchors = [(0, 0), (19, -14), (-40, -13), (37, 22), (-3, 40)]
+    n_contact = n_float_overlap_at_contact = 0
+    for size_a in GEOMETRY.sizes:
+        for size_b in GEOMETRY.sizes:
+            for a in anchors:
+                for dx in range(-30, 31):
+                    for dy in range(-30, 31):
+                        b = (a[0] + dx, a[1] + dy)
+                        d2, limit2 = collides_by(GEOMETRY, a, size_a, b, size_b)
+                        exact = GEOMETRY.collides(a, size_a, b, size_b)
+                        assert exact == (d2 < limit2)
+                        float_test = GEOMETRY.overlaps(a, size_a, b, size_b)
+                        if d2 == limit2:
+                            n_contact += 1
+                            n_float_overlap_at_contact += float_test
+                        else:
+                            assert exact == float_test
+    # Contact cells exist, and the float test does misjudge some of them.
+    assert n_contact > 0
+    assert n_float_overlap_at_contact > 0
+
+
+def test_geometry_off_the_cell_grid_falls_back_to_floats():
+    with open(PROPERTIES_JSON) as f:
+        properties = json.load(f)
+    properties["size"]["small"] = 0.31
+    with pytest.warns(UserWarning, match="whole grid cells"):
+        geometry = Geometry(properties)
+    a, b = (19, -14), (16, -18)
+    assert geometry.collides(a, "small", b, "small") == geometry.overlaps(
+        a, "small", b, "small"
+    )
+
+
+def contact_inner_scene():
+    # W moves left.1 from (19, -4) to (19, -14); U (small) at (16, -18) is
+    # at the minimum distance 5 (offset 3, 4) from there.
+    return [[obj(W, [19, -4]), obj(U, [16, -18])]]
+
+
+def test_inner_move_allowed_at_exact_contact():
+    assert GEOMETRY.overlaps((19, -14), "small", (16, -18), "small")
+    assert "position.left.1" in actions(decoder(contact_inner_scene()), W)
+    # One cell closer is a real overlap.
+    members = contact_inner_scene()
+    members[0][1] = obj(U, [17, -18])
+    assert "position.left.1" not in actions(decoder(members), W)
+
+
+def contact_in_scene():
+    # T (large) waits at (-40, -13); only behind.2 -> (-20, -13) and
+    # behind-right.2 -> (-20, 7) bring it in. In member 1, V (medium) at
+    # (-20, 18) touches (-20, 7) (distance 11 = 6 + 4 + 1) and W (medium too)
+    # really overlaps (-20, -13), so behind-right.2 is the only common move
+    # and it is lost to the float test.
+    medium_w = ("medium",) + W[1:]
+    return [
+        [obj(T, [-40, -13]), obj(V, [0, 0])],
+        [obj(T, [-40, -13]), obj(V, [-20, 18]), obj(medium_w, [-20, -9])],
+    ]
+
+
+def test_in_move_with_common_move_at_exact_contact():
+    assert GEOMETRY.overlaps((-20, 7), "large", (-20, 18), "medium")
+    d = decoder(contact_in_scene())
+    assert "position.in" in actions(d, T)
+    m1 = d.executor.members[1]
+    assert m1.moves_for(0, "in") == {("behind-right", "2")}
+    # A real overlap instead of the contact loses the move.
+    members = contact_in_scene()
+    members[1][1] = obj(V, [-20, 17])
+    assert "position.in" not in actions(decoder(members), T)
+
+
+def test_in_candidates_ignore_exact_contact():
+    # The generator's in_candidates use the float test, so the contact cell
+    # (-20, 7) is not a candidate and is not reserved. T may still land there,
+    # since the move itself passes Blender's test.
+    members = [[obj(T, [-40, -13]), obj(V, [-20, 18])]]
+    d = decoder(members, [(T, "position.in")])
+    m0 = d.executor.members[0]
+    assert m0.objects[0].cells == [(-20, -13), (-20, 7)]
+    assert m0.objects[0].float_cells == [(-20, -13)]
+    assert m0.reserved == {0: [(-20, -13)]}
+
+
+def test_in_move_lands_at_exact_contact():
+    # In member 1 of contact_in_scene, T can only land at the contact cell
+    # (-20, 7). T is there afterwards, but P(o) is empty, so nothing is
+    # reserved.
+    d = decoder(contact_in_scene(), [(T, "position.in")])
+    m1 = d.executor.members[1]
+    t = m1.objects[0]
+    assert t.cells == [(-20, 7)]
+    assert t.float_cells == []
+    assert m1.reserved == {0: []}
+    # T blocks the others there and only there: V may move behind.1 to
+    # (-10, 18) but not behind-left.1 to (-10, 8), and W may grow.
+    assert m1.valid(1, "position.behind.1")
+    assert not m1.valid(1, "position.behind-left.1")
+    assert m1.valid(2, "size.large")
+    assert ("front", "1") in m1.moves_for(1, "out")
+
+
+def test_reservation_ignores_exact_contact():
+    # U (small) may come in at (-20, 0), (-20, 20) or (-20, -20), all reserved.
+    # W (small) at (-17, 14) moving right.1 to (-17, 24) would touch the
+    # reserved (-20, 20) (offset 3, 4), which the float test of the
+    # reservation still calls blocked; right.2 is clear.
+    members = [[obj(U, [-40, 0]), obj(W, [-17, 14])]]
+    d = decoder(members, [(U, "position.in")])
+    m0 = d.executor.members[0]
+    assert (-20, 20) in m0.reserved[0]
+    assert GEOMETRY.overlaps((-17, 24), "small", (-20, 20), "small")
+    moves = m0.moves_for(1, "out")
+    assert ("right", "1") not in moves
+    assert ("right", "2") in moves
+
+
+def test_size_growth_allowed_at_exact_contact():
+    # W (small) at (0, 0) grows to large; the large V at (12, 5) is at
+    # 13 = 6 + 6 + 1 then.
+    large_v = ("large",) + V[1:]
+    assert GEOMETRY.overlaps((0, 0), "large", (12, 5), "large")
+    members = [[obj(W, [0, 0]), obj(large_v, [12, 5])]]
+    assert "size.large" in actions(decoder(members), W)
+    members = [[obj(W, [0, 0]), obj(large_v, [11, 5])]]
+    assert "size.large" not in actions(decoder(members), W)
+
+
+def test_out_move_at_exact_contact_keeps_float_cells():
+    # W (small) at (19, 1): right.2 leaves the view at (19, 21), which U
+    # (small) at (22, 17) touches. The move is free, so the out is valid and
+    # the destination is among the possible cells, but the cells that 'in'
+    # candidates see (float_cells) are the float test's, as before.
+    members = [[obj(W, [19, 1]), obj(U, [22, 17])]]
+    d = decoder(members)
+    m0 = d.executor.members[0]
+    assert ("right", "2") in m0.moves_for(0, "out")
+    assert "position.out" in actions(d, W)
+    d = decoder(members, [(W, "position.out")])
+    w = d.executor.members[0].objects[0]
+    assert (19, 21) in w.cells
+    assert (19, 21) not in w.float_cells
+    assert set(w.float_cells) < set(w.cells)
 
 
 # --- repeated moves -------------------------------------------------------
