@@ -453,3 +453,23 @@ def test_repeated_attr_steps():
         {"obj_idx": 1, "attr": "size", "pair": "size.large"}
     )
     assert group.repeated_attr_steps(info) == [(4, 1, "size")]
+
+
+def test_seg_object_tolerates_off_by_one_colours():
+    option = get_option()
+    # Exact render colours, and the cluster's GPU renders of Object_2 and
+    # Object_3, which are one level off in one channel.
+    assert option.get_seg_object((185, 28, 213)) == "Object_1"
+    assert option.get_seg_object((174, 129, 211)) == "Object_2"
+    assert option.get_seg_object((160, 211, 177, 255)) == "Object_3"
+    assert option.get_seg_object((64, 64, 64)) == "Background"
+    # Colours between objects belong to none.
+    assert option.get_seg_object((174, 129, 205)) is None
+    assert option.get_seg_object((100, 100, 100)) is None
+    # The render colours are far enough apart for the tolerance.
+    colors = list(option.render_colors.values())
+    assert min(
+        max(abs(a - b) for a, b in zip(x, y))
+        for i, x in enumerate(colors)
+        for y in colors[i + 1:]
+    ) > 2 * 3

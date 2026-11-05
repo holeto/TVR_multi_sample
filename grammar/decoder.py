@@ -6,9 +6,10 @@ side. The mask comes from an executor (executor.py): at the start of each
 step it computes the set V of valid steps (R, A), and each rule of the step is
 allowed only if it can still complete a step in V.
 
-With use_init_desc (the default) V is computed in every member from its
-init_desc. Without it, only the program decoded so far constrains V
-(ProgramExecutor), so the mask allows a superset of the programs.
+With use_init_desc (the default) V is computed in every scene given, from
+each scene's init_desc. Without it, only the program decoded so far
+constrains V (ProgramExecutor), so the mask allows a superset of the
+programs.
 """
 import random
 
@@ -17,6 +18,17 @@ from .executor import Executor, ProgramExecutor
 from .geometry import Geometry
 
 MAX_STEPS = 4
+# The value terminal of each rule NT -> 'value'.
+RULE_VALUE = {
+    i: terminal(r.rhs[0])
+    for i, r in enumerate(RULES)
+    if len(r.rhs) == 1 and is_terminal(r.rhs[0])
+}
+# The terminals of each A rule, e.g. ("position", "out").
+A_TERMINALS = [
+    (rule, tuple(terminal(s) for s in RULES[rule].rhs if is_terminal(s)))
+    for rule in RULES_OF["A"]
+]
 
 
 class MaskError(ValueError):
@@ -32,10 +44,12 @@ class MaskedDecoder:
         max_steps=MAX_STEPS,
         use_init_desc=True,
     ):
-        """members: one init_desc per member (a list of stage-0 objects, each
-        {"size", "color", "material", "shape", "position": [x, y]}); needed
-        with use_init_desc, ignored without. geometry: Geometry(), read from
-        properties.json, by default."""
+        """members: a list of one or more scenes, one init_desc each (a list of
+        stage-0 objects, each {"size", "color", "material", "shape",
+        "position": [x, y]}). A step must be valid in every scene given: one
+        scene masks a single pair, all members of a group require validity
+        for the whole group. Needed with use_init_desc, ignored without.
+        geometry: Geometry(), read from properties.json, by default."""
         geometry = geometry or Geometry()
         if use_init_desc:
             if members is None:
@@ -50,9 +64,16 @@ class MaskedDecoder:
         self.stack = [("T", None)]
         self.rules = []
         self.tokens = []
-        self._valid_map = None
         self._desc = []
         self._action = []
+        self._reset_step()
+
+    def _reset_step(self):
+        # Drop V and what is derived from it; they are rebuilt lazily.
+        self._valid_map = None
+        self._desc_prefixes = None
+        self._action_prefixes = {}
+        self._mask = None
 
     @property
     def done(self):
@@ -64,6 +85,28 @@ class MaskedDecoder:
         if self._valid_map is None:
             self._valid_map = self.executor.valid_steps()
         return self._valid_map
+
+    def _desc_prefix_set(self):
+        # Every prefix of a descriptor in V, so that R's rules test one
+        # membership each.
+        if self._desc_prefixes is None:
+            self._desc_prefixes = set(
+                desc[:n] for desc in self.valid_map for n in range(1, 5)
+            )
+        return self._desc_prefixes
+
+    def _action_prefix_set(self, desc):
+        # Every action of V for desc and its prefixes of whole parts, as
+        # text: "position", "position.front", "position.front.1".
+        prefixes = self._action_prefixes.get(desc)
+        if prefixes is None:
+            prefixes = set()
+            for action in self.valid_map.get(desc, ()):
+                parts = action.split(".")
+                for n in range(1, len(parts) + 1):
+                    prefixes.add(".".join(parts[:n]))
+            self._action_prefixes[desc] = prefixes
+        return prefixes
 
     @property
     def valid(self):
@@ -87,6 +130,12 @@ class MaskedDecoder:
 
     def mask(self):
         """Allowed rules (list of K bools) for the top of the stack."""
+        # Cached until the next apply(), which also needs it.
+        if self._mask is None:
+            self._mask = self._compute_mask()
+        return list(self._mask)
+
+    def _compute_mask(self):
         allowed = [False] * K
         if self.done:
             allowed[NOOP] = True
@@ -103,11 +152,9 @@ class MaskedDecoder:
         elif symbol in ("S", "R"):
             allowed[RULES_OF[symbol][0]] = True
         elif symbol == "A":
-            actions = self._actions()
-            for rule in RULES_OF["A"]:
-                rhs = [terminal(s) for s in RULES[rule].rhs if is_terminal(s)]
-                for a in actions:
-                    parts = a.split(".")
+            actions = [a.split(".") for a in self._actions()]
+            for rule, rhs in A_TERMINALS:
+                for parts in actions:
                     if parts[0] != rhs[0]:
                         continue
                     if len(rhs) == 2 and parts[1] != rhs[1]:
@@ -117,26 +164,25 @@ class MaskedDecoder:
                     allowed[rule] = True
                     break
         elif role == "R":
+            prefixes = self._desc_prefix_set()
+            desc = tuple(self._desc)
             for rule in RULES_OF[symbol]:
-                prefix = tuple(self._desc) + (terminal(RULES[rule].rhs[0]),)
-                allowed[rule] = any(
-                    d[: len(prefix)] == prefix for d in self.valid_map
-                )
+                allowed[rule] = desc + (RULE_VALUE[rule],) in prefixes
         else:
-            actions = self._actions()
+            # A rule is allowed if the action so far plus its value is an
+            # action of V, or the start of one.
+            prefixes = self._action_prefix_set(tuple(self._desc))
             for rule in RULES_OF[symbol]:
-                action = ".".join(
-                    self._action + [terminal(RULES[rule].rhs[0])]
-                )
-                allowed[rule] = any(
-                    a == action or a.startswith(action + ".") for a in actions
-                )
+                action = ".".join(self._action + [RULE_VALUE[rule]])
+                allowed[rule] = action in prefixes
         return allowed
 
     def apply(self, rule):
         """Expand the top of the stack with rule. Raises MaskError if the
         mask does not allow it."""
-        if not self.mask()[rule]:
+        if self._mask is None:
+            self._mask = self._compute_mask()
+        if not self._mask[rule]:
             raise MaskError(
                 "rule {} not allowed at {} (steps so far {})".format(
                     rule,
@@ -144,6 +190,7 @@ class MaskedDecoder:
                     self.executor.steps,
                 )
             )
+        self._mask = None
         self.rules.append(rule)
         if rule == NOOP:
             return
@@ -178,7 +225,7 @@ class MaskedDecoder:
         if action not in self.valid_map.get(desc, ()):
             raise MaskError("step {} {} is not valid".format(desc, action))
         self.executor.apply(desc, action)
-        self._valid_map = None
+        self._reset_step()
         self._desc = []
         self._action = []
 

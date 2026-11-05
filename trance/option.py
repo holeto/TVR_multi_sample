@@ -110,11 +110,21 @@ class Option:
     def get_material_val(self, key):
         return self._get_val("material", key)
 
-    def get_seg_object(self, color):
+    def get_seg_object(self, color, tolerance=3):
+        # Name of the object whose render colour is nearest to `color`, if
+        # every channel is within `tolerance` levels; otherwise None. Renders
+        # may be off by a level: the cluster's GPU renders draw Object_2 and
+        # Object_3 one level off in one channel, and an exact match made them
+        # count as occluded whenever they were in view. The render colours
+        # are at least 32 levels apart, so a small tolerance stays unambiguous.
+        best, best_dist = None, tolerance + 1
         for obj, render_color in self.render_colors.items():
-            if tuple(color[:3]) == tuple(render_color[:3]):
-                return obj
-        return None
+            dist = max(
+                abs(int(a) - int(b)) for a, b in zip(color[:3], render_color)
+            )
+            if dist < best_dist:
+                best, best_dist = obj, dist
+        return best
 
     def get_move_options(self, x, y):
         visible_position = []

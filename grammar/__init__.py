@@ -2,7 +2,7 @@
 
 - cfg: the context-free grammar, parse trees and leftmost derivations.
 - geometry: grid, visibility and overlaps, as in the generator.
-- executor: per-member state and the valid steps V.
+- executor: per-scene state and the valid steps V.
 - decoder: the masked leftmost derivation (GVAE stack decoder's mask).
 - data: programs and init_desc of generated data.
 """

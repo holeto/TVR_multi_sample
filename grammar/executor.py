@@ -1,8 +1,9 @@
 """Executors behind the decoder's mask.
 
-Executor keeps one state per member of a transformation, built from that
-member's init_desc (the stage-0 objects: size, color, material, shape, grid
-position), and decides which steps (R, A) are valid in every member.
+Executor keeps one state per scene given, built from that scene's init_desc
+(the stage-0 objects: size, color, material, shape, grid position), and
+decides which steps (R, A) are valid in every scene given. A scene is one
+pair's own scene or every member of a group.
 ProgramExecutor works without init_desc: it judges a step only by the program
 decoded so far (see its docstring for what that still covers).
 
@@ -61,6 +62,13 @@ def actions():
 
 
 ACTIONS = actions()
+# Masks test every action in every scene, so each is split only once.
+ACTION_PARTS = {action: tuple(action.split(".")) for action in ACTIONS}
+DESC_INDEX = {attr: i for i, attr in enumerate(DESC_ATTRS)}
+
+
+def action_parts(action):
+    return ACTION_PARTS.get(action) or tuple(action.split("."))
 
 
 class Obj:
@@ -79,7 +87,7 @@ class Obj:
 
 
 class Member:
-    """Executor state of one member."""
+    """Executor state of one scene."""
 
     def __init__(self, objects, geometry, allow_repeated_moves=False):
         self.geometry = geometry
@@ -87,11 +95,15 @@ class Member:
         self.objects = [Obj(obj) for obj in objects]
         # Index of the moved-in object -> its candidate cells.
         self.reserved = {}
+        # Stage-0 descriptors never change; ambiguous ones map to None.
+        self._index = {}
+        for i, o in enumerate(self.objects):
+            self._index[o.desc] = None if o.desc in self._index else i
+        self._obstacle_cache = {}
 
     def find(self, desc):
         """Index of the only object with this stage-0 descriptor, or None."""
-        found = [i for i, o in enumerate(self.objects) if o.desc == desc]
-        return found[0] if len(found) == 1 else None
+        return self._index.get(desc)
 
     def visible_now(self, o):
         if o.status == MOVED_IN:
@@ -105,15 +117,26 @@ class Member:
         exact=False uses the generator's float test, as for 'in' candidates;
         reserved cells are always judged by it."""
         geometry = self.geometry
-        test = geometry.collides if exact else geometry.overlaps
-        for j, other in enumerate(self.objects):
-            if j == idx:
-                continue
-            cells = other.cells
-            if not exact and other.float_cells is not None:
-                cells = other.float_cells
-            if all(test(cell, size, c, other.size) for c in cells):
-                return True
+        if exact and geometry.cell_sizes is not None:
+            # Geometry.collides inlined, since this loop dominates the time
+            # of a mask.
+            x, y = cell
+            for limit, cells in self._obstacles(idx, size):
+                for cx, cy in cells:
+                    if (x - cx) * (x - cx) + (y - cy) * (y - cy) >= limit:
+                        break
+                else:
+                    return True
+        else:
+            test = geometry.collides if exact else geometry.overlaps
+            for j, other in enumerate(self.objects):
+                if j == idx:
+                    continue
+                cells = other.cells
+                if not exact and other.float_cells is not None:
+                    cells = other.float_cells
+                if all(test(cell, size, c, other.size) for c in cells):
+                    return True
         if reserved:
             for owner, cells in self.reserved.items():
                 if owner == idx:
@@ -124,6 +147,24 @@ class Member:
                 ):
                     return True
         return False
+
+    def _obstacles(self, idx, size):
+        # The other objects as [(limit, cells)] for the exact test of
+        # object idx with the given size: a cell collides with an obstacle
+        # if its squared distance in cells to every one of its cells is
+        # below limit = (r_a + r_b + gap)^2. Cached until the next apply.
+        key = (idx, size)
+        obstacles = self._obstacle_cache.get(key)
+        if obstacles is None:
+            cell_sizes = self.geometry.cell_sizes
+            reach = cell_sizes[size] + self.geometry.cell_gap
+            obstacles = [
+                ((reach + cell_sizes[other.size]) ** 2, other.cells)
+                for j, other in enumerate(self.objects)
+                if j != idx
+            ]
+            self._obstacle_cache[key] = obstacles
+        return obstacles
 
     def free_moves(self, idx, visible, exact=True):
         """Moves of object idx from its cell whose destination is on the grid,
@@ -142,39 +183,56 @@ class Member:
 
     def valid(self, idx, action):
         """Whether object idx can undergo action here, except the 'in'/'out'
-        common-move test, which spans all members (see moves_for)."""
+        common-move test, which spans all scenes given (see moves_for)."""
+        return bool(self.valid_actions(idx, [action]))
+
+    def valid_actions(self, idx, actions):
+        """The actions, in their order, that valid() allows for object idx.
+        Judges them together, so the object's state is read once."""
         o = self.objects[idx]
         if o.status == MOVED_OUT:
-            return False
-        parts = action.split(".")
-        attr = parts[0]
-        if attr != "position":
-            value = parts[1]
-            if not self.visible_now(o) or attr in o.edited:
-                return False
-            if value == o.desc[DESC_ATTRS.index(attr)]:
-                return False
-            if attr == "size" and self.geometry.is_bigger(value, o.size):
-                return any(
-                    not self.blocked(idx, cell, value) for cell in o.cells
-                )
-            return True
-        if parts[1] in ("in", "out"):
-            return o.status == UNTOUCHED and self.geometry.visible(
-                o.start
-            ) == (parts[1] == "out")
-        # Inner move.
-        if o.status == MOVED_IN or not self.visible_now(o):
-            return False
-        if o.moved and not self.allow_repeated_moves:
-            return False
-        cell = self.geometry.destination(o.cells[0], (parts[1], parts[2]))
-        return (
-            self.geometry.on_grid(cell)
-            and self.geometry.visible(cell)
-            and cell != o.start
-            and not self.blocked(idx, cell, o.size)
+            return []
+        geometry = self.geometry
+        visible = self.visible_now(o)
+        can_move = (
+            o.status != MOVED_IN
+            and visible
+            and (not o.moved or self.allow_repeated_moves)
         )
+        result = []
+        for action in actions:
+            parts = action_parts(action)
+            attr = parts[0]
+            if attr != "position":
+                value = parts[1]
+                if not visible or attr in o.edited:
+                    continue
+                if value == o.desc[DESC_INDEX[attr]]:
+                    continue
+                if attr == "size" and geometry.is_bigger(value, o.size):
+                    ok = any(
+                        not self.blocked(idx, cell, value) for cell in o.cells
+                    )
+                else:
+                    ok = True
+            elif parts[1] in ("in", "out"):
+                ok = o.status == UNTOUCHED and geometry.visible(o.start) == (
+                    parts[1] == "out"
+                )
+            elif not can_move:
+                ok = False
+            else:
+                # Inner move.
+                cell = geometry.destination(o.cells[0], (parts[1], parts[2]))
+                ok = (
+                    geometry.on_grid(cell)
+                    and geometry.visible(cell)
+                    and cell != o.start
+                    and not self.blocked(idx, cell, o.size)
+                )
+            if ok:
+                result.append(action)
+        return result
 
     def free_in_cell(self, idx, move, exact):
         # Whether the in-move of object idx from its start ends on the grid,
@@ -236,13 +294,16 @@ class Member:
             ]
             o.status = TOUCHED
             o.moved = True
+        # The step changed a cell or size; the tests above used the old ones.
+        self._obstacle_cache = {}
 
 
 class StepRules:
     """The order rule and the set V, common to both executors.
 
     Subclasses provide descriptors(), step_valid(desc, action) and
-    apply(desc, action), which must append to self.steps.
+    apply(desc, action), which must append to self.steps; they may override
+    valid_actions(desc, actions) to judge a descriptor's actions together.
     """
 
     def __init__(self):
@@ -259,24 +320,39 @@ class StepRules:
             return True
         return (key_text(desc), action) >= (key_text(prev_desc), prev_action)
 
+    def actions_in_order(self, desc):
+        """The actions of ACTIONS that in_order allows for desc, in order.
+        The pairs compare by descriptor text first, so only the previous
+        step's own descriptor needs a test per action."""
+        if not self.steps:
+            return ACTIONS
+        prev_desc, prev_action = self.steps[-1]
+        if prev_desc == desc and prev_action == "position.in":
+            return ACTIONS
+        key, prev_key = key_text(desc), key_text(prev_desc)
+        if key != prev_key:
+            return ACTIONS if key > prev_key else []
+        return [action for action in ACTIONS if action >= prev_action]
+
+    def valid_actions(self, desc, actions):
+        """The actions, in their order, that step_valid allows for desc."""
+        return [action for action in actions if self.step_valid(desc, action)]
+
     def valid_steps(self):
         """V: valid steps for the next step, as {descriptor: set(actions)}
         (descriptors without a valid action are left out)."""
         result = {}
         for desc in self.descriptors():
-            actions = set(
-                action
-                for action in ACTIONS
-                if self.in_order(desc, action)
-                and self.step_valid(desc, action)
-            )
+            actions = self.actions_in_order(desc)
             if actions:
-                result[desc] = actions
+                actions = self.valid_actions(desc, actions)
+            if actions:
+                result[desc] = set(actions)
         return result
 
 
 class Executor(StepRules):
-    """Executor states of all members of one transformation."""
+    """Executor states of the scenes in `members` (one scene or a group)."""
 
     def __init__(self, members, geometry, allow_repeated_moves=False):
         super().__init__()
@@ -284,31 +360,50 @@ class Executor(StepRules):
             Member(objects, geometry, allow_repeated_moves)
             for objects in members
         ]
+        # R names stage-0 objects, so the descriptors and their object in
+        # each scene are fixed: descriptor -> [index per scene].
+        self._indices = {}
+        for desc in set(o.desc for o in self.members[0].objects):
+            indices = [m.find(desc) for m in self.members]
+            if all(i is not None for i in indices):
+                self._indices[desc] = indices
+        self._descriptors = sorted(self._indices)
 
     def descriptors(self):
-        """Descriptors that name exactly one object in every member."""
-        candidates = set(o.desc for o in self.members[0].objects)
-        return sorted(
-            desc
-            for desc in candidates
-            if all(m.find(desc) is not None for m in self.members)
-        )
+        """Descriptors that name exactly one object in every scene given."""
+        return list(self._descriptors)
 
     def step_valid(self, desc, action):
-        """Validity of the step (R, A) in every member, without the order."""
-        indices = [m.find(desc) for m in self.members]
-        if any(i is None for i in indices):
-            return False
-        if not all(m.valid(i, action) for m, i in zip(self.members, indices)):
-            return False
-        parts = action.split(".")
-        if parts[0] == "position" and parts[1] in ("in", "out"):
-            common = None
-            for m, i in zip(self.members, indices):
-                moves = m.moves_for(i, parts[1])
-                common = moves if common is None else common & moves
-            return bool(common)
-        return True
+        """Validity of the step (R, A) in every scene given, ignoring order."""
+        return bool(self.valid_actions(desc, [action]))
+
+    def valid_actions(self, desc, actions):
+        indices = self._indices.get(desc)
+        if indices is None:
+            return []
+        for m, i in zip(self.members, indices):
+            actions = m.valid_actions(i, actions)
+            if not actions:
+                return []
+        result = []
+        for action in actions:
+            attr, kind = action_parts(action)[:2]
+            if attr == "position" and kind in ("in", "out"):
+                if not self.common_move(indices, kind):
+                    continue
+            result.append(action)
+        return result
+
+    def common_move(self, indices, kind):
+        """Whether one (direction, n) of an 'in' or 'out' is feasible in
+        every scene, for the object indices[k] of scene k."""
+        common = None
+        for m, i in zip(self.members, indices):
+            moves = m.moves_for(i, kind)
+            common = moves if common is None else common & moves
+            if not common:
+                return False
+        return common is not None
 
     def apply(self, desc, action):
         for m in self.members:
@@ -345,6 +440,7 @@ class ProgramExecutor(StepRules):
         self.geometry = geometry
         self.allow_repeated_moves = allow_repeated_moves
         self.history = {}
+        self._moves_key = tuple(sorted(geometry.moves.items()))
         self._descriptors = [
             (size, color, material, shape)
             for size in SIZES
@@ -358,6 +454,24 @@ class ProgramExecutor(StepRules):
 
     def _history(self, desc):
         return self.history.get(desc) or History()
+
+    # Valid actions of a descriptor the program has not named yet, as
+    # (list, set), by (moves, descriptor); shared by all instances.
+    _unnamed = {}
+
+    def valid_actions(self, desc, actions):
+        if desc in self.history:
+            return super().valid_actions(desc, actions)
+        # A fresh History judges the step, so the result depends only on
+        # the descriptor and the geometry's moves.
+        key = (self._moves_key, desc)
+        cached = ProgramExecutor._unnamed.get(key)
+        if cached is None:
+            valid = super().valid_actions(desc, ACTIONS)
+            cached = ProgramExecutor._unnamed[key] = (valid, set(valid))
+        if actions is ACTIONS:
+            return cached[0]
+        return [action for action in actions if action in cached[1]]
 
     def step_valid(self, desc, action):
         h = self._history(desc)
