@@ -300,19 +300,41 @@ def test_in_move_lands_at_exact_contact():
     assert ("front", "1") in m1.moves_for(1, "out")
 
 
-def test_reservation_ignores_exact_contact():
+def test_reservation_is_free_at_exact_contact():
     # U (small) may come in at (-20, 0), (-20, 20) or (-20, -20), all reserved.
     # W (small) at (-17, 14) moving right.1 to (-17, 24) would touch the
-    # reserved (-20, 20) (offset 3, 4), which the float test of the
-    # reservation still calls blocked; right.2 is clear.
+    # reserved (-20, 20) (offset 3, 4). The float test calls that blocked
+    # here, but the generator's Python may round it the other way.
     members = [[obj(U, [-40, 0]), obj(W, [-17, 14])]]
     d = decoder(members, [(U, "position.in")])
     m0 = d.executor.members[0]
     assert (-20, 20) in m0.reserved[0]
     assert GEOMETRY.overlaps((-17, 24), "small", (-20, 20), "small")
     moves = m0.moves_for(1, "out")
-    assert ("right", "1") not in moves
+    assert ("right", "1") in moves
     assert ("right", "2") in moves
+
+
+def test_candidate_at_exact_contact_is_not_reserved():
+    # trans_id 9902 of center_2step: the cylinder may come in at (-6, -3), at
+    # exactly the minimum distance from the cube at (-3, 1). The float test
+    # here calls that cell free, the generator's called it taken and let the
+    # cube grow; the grown cube would overlap the cell.
+    cylinder = ("small", "brown", "glass", "cylinder")
+    cube = ("small", "purple", "rubber", "cube")
+    members = [[obj(cylinder, [-6, -23]), obj(cube, [-3, 1])]]
+    d = decoder(members, [(cylinder, "position.in")])
+    m0 = d.executor.members[0]
+    assert (-6, -3) in m0.objects[0].float_cells
+    assert GEOMETRY.touches((-6, -3), "small", (-3, 1), "small")
+    assert (-6, -3) not in m0.reserved[0]
+    assert (-6, -13) in m0.reserved[0]
+    assert "size.large" in actions(d, cube)
+    # A candidate that is not at contact still blocks the growth.
+    members = [[obj(cylinder, [-6, -23]), obj(cube, [-6, 4])]]
+    d = decoder(members, [(cylinder, "position.in")])
+    assert (-6, -3) in d.executor.members[0].reserved[0]
+    assert "size.large" not in actions(d, cube)
 
 
 def test_size_growth_allowed_at_exact_contact():

@@ -20,7 +20,11 @@ Geometry.collides (exact contact is free), so the destinations of 'in' and
 Geometry.overlaps, as Renderer.in_candidates does; P(o) may therefore miss a
 destination at exact contact. P(o) sees moved objects at their float-test
 cells (Obj.float_cells), so the reserved sets stay what they were before
-collides existed.
+collides existed. The generator ran that float test in Blender's Python, which
+rounds exact contact differently from this one, so the reservation never
+decides at exact contact: such a cell of P(o) is not reserved, and a step
+touching a reserved cell is allowed. A mask may thus allow a little more than
+the generator did, but never rejects what it produced.
 """
 from .cfg import COLORS, DIRECTIONS, MATERIALS, SHAPES, SIZES, STEPS
 
@@ -115,7 +119,8 @@ class Member:
     def blocked(self, idx, cell, size, reserved=True, exact=True):
         """Whether object idx would collide at cell with the given size.
         exact=False uses the generator's float test, as for 'in' candidates;
-        reserved cells are always judged by it."""
+        reserved cells are judged by Geometry.collides (exact contact is
+        free), see the module docstring."""
         geometry = self.geometry
         if exact and geometry.cell_sizes is not None:
             # Geometry.collides inlined, since this loop dominates the time
@@ -143,10 +148,20 @@ class Member:
                     continue
                 owner_size = self.objects[owner].size
                 if any(
-                    geometry.overlaps(cell, size, c, owner_size) for c in cells
+                    geometry.collides(cell, size, c, owner_size) for c in cells
                 ):
                     return True
         return False
+
+    def at_contact(self, idx, cell, size):
+        # Whether the cell is at exactly the minimum distance from a possible
+        # cell of another object.
+        return any(
+            self.geometry.touches(cell, size, c, other.size)
+            for j, other in enumerate(self.objects)
+            if j != idx
+            for c in other.cells
+        )
 
     def _obstacles(self, idx, size):
         # The other objects as [(limit, cells)] for the exact test of
@@ -275,7 +290,11 @@ class Member:
             o.cells, o.float_cells = exact_cells, float_cells
             o.status = MOVED_IN
             o.moved = True
-            self.reserved[idx] = float_cells
+            self.reserved[idx] = [
+                cell
+                for cell in float_cells
+                if not self.at_contact(idx, cell, o.size)
+            ]
         elif parts[1] == "out":
             start = o.cells[0]
             exact_cells, float_cells = (

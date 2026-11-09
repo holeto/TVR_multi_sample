@@ -100,5 +100,19 @@ class Geometry:
         dy = cell_a[1] - cell_b[1]
         return dx * dx + dy * dy < limit * limit
 
+    def touches(self, cell_a, size_a, cell_b, size_b):
+        """Whether two objects at grid cells are at exactly the minimum
+        distance, where overlaps rounds either way, differently between
+        Python versions (math.hypot changed in 3.8). Never off the cell grid,
+        where the distance has no exact form."""
+        if self.cell_sizes is None:
+            return False
+        limit = (
+            self.cell_sizes[size_a] + self.cell_sizes[size_b] + self.cell_gap
+        )
+        dx = cell_a[0] - cell_b[0]
+        dy = cell_a[1] - cell_b[1]
+        return dx * dx + dy * dy == limit * limit
+
     def is_bigger(self, size_a, size_b):
         return self.sizes[size_a] > self.sizes[size_b]
