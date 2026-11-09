@@ -39,6 +39,8 @@ def write_h5(h5, split, samples, image_dir, image_width, image_height):
     f_split.create_dataset("keys", data=str(keys))
     f_split.create_dataset("basic_keys", data=str(basic_keys))
 
+    # Both states of a 0-step sample are one image file.
+    images = list(dict.fromkeys(images))
     for image in tqdm(images, desc=f"{split} images"):
         image_path = image_dir / image
         assert image_path.is_file()

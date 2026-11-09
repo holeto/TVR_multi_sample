@@ -185,7 +185,7 @@ class SampleManager:
         if not keep_init_vis:
             self.n_init_vis[self.init_vis] -= 1
         # A failed initial state comes before the number of steps is drawn;
-        # step is then still 0 from reset(), which is not a key of n_step.
+        # step is then still None from reset(), which is not a key of n_step.
         if self.step in self.n_step:
             self.n_step[self.step] -= 1
         self.record_seq_trans(self.seq_trans, addition=False)
@@ -202,7 +202,8 @@ class SampleManager:
 
         if not stage:
             self.init_vis = 0
-            self.step = 0
+            # Not 0, which is a valid number of steps with min_trans 0.
+            self.step = None
             self.seq_trans = []
             self.t_sample = time.time()
             self.tried_pairs = []

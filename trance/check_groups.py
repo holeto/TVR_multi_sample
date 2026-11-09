@@ -173,6 +173,9 @@ def core_distractors(members):
 
 
 def is_canonical(info):
+    # A 0-step transformation has no order to check.
+    if not info["transformations"]:
+        return True
     keep_size = "size" in info["transformations"][0]["obj_desc"]
     plan = group.extract_plan(
         info, lambda x, y: True, ["small", "medium", "large"], keep_size
